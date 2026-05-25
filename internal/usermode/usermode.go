@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
@@ -166,8 +167,10 @@ func prepareDirectories(cfg *config.Config, log *logging.Logger) error {
 // chownImageDirs sets ownership of the image-internal directories and the
 // known files within them to PROXY_UID:PROXY_GID.
 func chownImageDirs(cfg *config.Config, log *logging.Logger) error {
-	uid := int(cfg.ProxyUID)
-	gid := int(cfg.ProxyGID)
+	uid, gid, err := uidGIDToInt(cfg.ProxyUID, cfg.ProxyGID)
+	if err != nil {
+		return err
+	}
 
 	log.Debugf("usermode: setting ownership of image directories to %d:%d", uid, gid)
 
@@ -203,6 +206,13 @@ func chownImageDirs(cfg *config.Config, log *logging.Logger) error {
 	}
 
 	return nil
+}
+
+func uidGIDToInt(uid, gid uint32) (intUID, intGID int, err error) {
+	if strconv.IntSize == 32 && (uid > math.MaxInt32 || gid > math.MaxInt32) {
+		return 0, 0, fmt.Errorf("usermode: UID %d or GID %d is out of bounds for int", uid, gid)
+	}
+	return int(uid), int(gid), nil
 }
 
 // reexecAsUser calls su-exec to replace the current process with an

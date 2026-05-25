@@ -1,7 +1,9 @@
 package usermode
 
 import (
+	"math"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
@@ -107,6 +109,24 @@ func TestIsDirOwnedBy(t *testing.T) {
 	}
 	if isDirOwnedBy("/nonexistent", uid, gid) {
 		t.Error("isDirOwnedBy: expected false for nonexistent path")
+	}
+}
+
+func TestUIDGIDToInt(t *testing.T) {
+	uid, gid, err := uidGIDToInt(911, 912)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if uid != 911 || gid != 912 {
+		t.Fatalf("got %d:%d, want 911:912", uid, gid)
+	}
+
+	_, _, err = uidGIDToInt(uint32(math.MaxInt32)+1, 912)
+	if strconv.IntSize == 32 && err == nil {
+		t.Fatal("expected error for UID outside int range")
+	}
+	if strconv.IntSize == 64 && err != nil {
+		t.Fatalf("unexpected error on 64-bit int: %v", err)
 	}
 }
 
