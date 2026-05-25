@@ -209,10 +209,25 @@ func chownImageDirs(cfg *config.Config, log *logging.Logger) error {
 }
 
 func uidGIDToInt(uid, gid uint32) (intUID, intGID int, err error) {
-	if strconv.IntSize == 32 && (uid > math.MaxInt32 || gid > math.MaxInt32) {
-		return 0, 0, fmt.Errorf("usermode: UID %d or GID %d is out of bounds for int", uid, gid)
+	intUID, err = uint32ToInt(uid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("usermode: UID %d is out of bounds for int: %w", uid, err)
 	}
-	return int(uid), int(gid), nil
+
+	intGID, err = uint32ToInt(gid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("usermode: GID %d is out of bounds for int: %w", gid, err)
+	}
+
+	return intUID, intGID, nil
+}
+
+func uint32ToInt(value uint32) (int, error) {
+	converted, err := strconv.Atoi(strconv.FormatUint(uint64(value), 10))
+	if err != nil {
+		return 0, fmt.Errorf("convert uint32 to int: %w", err)
+	}
+	return converted, nil
 }
 
 // reexecAsUser calls su-exec to replace the current process with an
