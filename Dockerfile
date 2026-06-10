@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     ./cmd/entrypoint/
 
 # ── Stage 2: download wgcf and mihomo for the target platform ─────────────────
-FROM alpine:3.23.4@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11 AS bin-builder
+FROM alpine:3.24.0@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acaeb241c829f4 AS bin-builder
 
 # ash supports -e and -o pipefail via the SHELL directive; required for
 # correct pipe exit-code propagation in the download verification steps.
@@ -86,7 +86,7 @@ RUN MIHOMO_VERSION=$(wget -q -O - \
     chmod +x /tmp/mihomo
 
 # ── Stage 3: final image ───────────────────────────────────────────────────────
-FROM alpine:3.23.4@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
+FROM alpine:3.24.0@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acaeb241c829f4
 
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
