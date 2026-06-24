@@ -2,7 +2,7 @@
 
 # ── Stage 1: compile the Go entrypoint binary ─────────────────────────────────
 # TARGETOS/TARGETARCH are injected by buildx for each platform in the matrix.
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine3.23@sha256:eb5a920799142c2fe9ec705cfa0ebcc4380e2e2f041b84e9ae5c6d82a2e56c82 AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine3.23@sha256:18b460dd17542c2ba43299a633cf6ebfc1115101509531471d7cfce1019af083 AS go-builder
 
 ARG TARGETOS
 ARG TARGETARCH
