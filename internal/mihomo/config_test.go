@@ -1,9 +1,12 @@
-//nolint:errcheck,forcetypeassert // Type assertions in tests safely panic on failure
 package mihomo
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -52,9 +55,37 @@ func testConfig(dir string) *config.Config {
 	}
 }
 
-// hasProxy returns true when the proxies slice (from readYAML) contains an
-// entry with the given name. Works with map[string]any entries produced by
-// yaml.Unmarshal into map[string]any.
+func getSlice(t *testing.T, m map[string]any, key string) []any {
+	t.Helper()
+	val, ok := m[key]
+	if !ok {
+		t.Fatalf("key %q not found in document", key)
+	}
+	s, ok := val.([]any)
+	if !ok {
+		t.Fatalf("key %q is not []any, got %T", key, val)
+	}
+	return s
+}
+
+func getString(t *testing.T, val any) string {
+	t.Helper()
+	s, ok := val.(string)
+	if !ok {
+		t.Fatalf("value is not string, got %T", val)
+	}
+	return s
+}
+
+func getMap(t *testing.T, val any) map[string]any {
+	t.Helper()
+	m, ok := val.(map[string]any)
+	if !ok {
+		t.Fatalf("value is not map[string]any, got %T", val)
+	}
+	return m
+}
+
 func hasProxy(proxies []any, name string) bool {
 	for _, p := range proxies {
 		if m, ok := p.(map[string]any); ok {
@@ -66,10 +97,10 @@ func hasProxy(proxies []any, name string) bool {
 	return false
 }
 
-// readYAML parses a YAML file into map[string]any for assertions.
 func readYAML(t *testing.T, path string) map[string]any {
 	t.Helper()
-	data, err := os.ReadFile(path) // #nosec G304
+	cleanPath := filepath.Clean(path)
+	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		t.Fatalf("readYAML: %v", err)
 	}
@@ -79,8 +110,6 @@ func readYAML(t *testing.T, path string) map[string]any {
 	}
 	return doc
 }
-
-// --- EnsureConfig: first run (no existing config) ---
 
 func TestEnsureConfigCreatesTemplate(t *testing.T) {
 	dir := t.TempDir()
@@ -116,8 +145,8 @@ func TestTemplateRulesWarp(t *testing.T) {
 	}
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
-	rules := doc["rules"].([]any)
-	if len(rules) != 1 || rules[0].(string) != minimalTemplateWarpRule() {
+	rules := getSlice(t, doc, "rules")
+	if len(rules) != 1 || getString(t, rules[0]) != minimalTemplateWarpRule() {
 		t.Errorf("template rules: got %v, want [%s]", rules, minimalTemplateWarpRule())
 	}
 }
@@ -132,8 +161,8 @@ func TestTemplateRulesDirect(t *testing.T) {
 	}
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
-	rules := doc["rules"].([]any)
-	if len(rules) != 1 || rules[0].(string) != minimalTemplateDirectRule() {
+	rules := getSlice(t, doc, "rules")
+	if len(rules) != 1 || getString(t, rules[0]) != minimalTemplateDirectRule() {
 		t.Errorf("template rules: got %v, want [%s]", rules, minimalTemplateDirectRule())
 	}
 }
@@ -154,8 +183,6 @@ func TestEnsureConfigFilePermissions(t *testing.T) {
 		t.Errorf("config file permissions: got %04o, want 0o600", perm)
 	}
 }
-
-// --- Owned fields are overwritten ---
 
 func TestPatchOverwritesOwnedFields(t *testing.T) {
 	dir := t.TempDir()
@@ -185,8 +212,6 @@ func TestPatchOverwritesOwnedFields(t *testing.T) {
 		t.Errorf("ipv6 not updated: got %v", doc["ipv6"])
 	}
 }
-
-// --- User-defined keys are preserved ---
 
 func TestPatchPreservesUserKeys(t *testing.T) {
 	dir := t.TempDir()
@@ -237,38 +262,32 @@ rules:
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
 
-	// User-defined listener must survive.
 	listeners, ok := doc["listeners"].([]any)
 	if !ok || len(listeners) == 0 {
 		t.Error("user-defined listeners were removed")
 	}
 
-	// User-defined proxy-groups must survive.
 	groups, ok := doc["proxy-groups"].([]any)
 	if !ok || len(groups) == 0 {
 		t.Error("user-defined proxy-groups were removed")
 	}
 
-	// All user rules must survive unchanged — patch never modifies rules[].
-	rules := doc["rules"].([]any)
+	rules := getSlice(t, doc, "rules")
 	if len(rules) != 2 {
 		t.Errorf("rules count changed: got %d, want 2", len(rules))
 	}
-	if rules[0].(string) != "DOMAIN-SUFFIX,preserve.example.com,DIRECT" {
+	if getString(t, rules[0]) != "DOMAIN-SUFFIX,preserve.example.com,DIRECT" {
 		t.Errorf("user rule[0] changed: got %q", rules[0])
 	}
-	if rules[1].(string) != "MATCH,PreserveGroup" {
+	if getString(t, rules[1]) != "MATCH,PreserveGroup" {
 		t.Errorf("user rule[1] changed: got %q", rules[1])
 	}
 }
-
-// --- patchWarpProxy appends when warp absent but other proxies exist ---
 
 func TestPatchAppendsWarpWhenMissingWithOtherProxies(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
 
-	// User config with a custom proxy but no warp entry.
 	userConfig := `
 mixed-port: 7890
 log-level: info
@@ -295,13 +314,11 @@ rules:
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
 
-	// Both proxies must be present.
-	proxies := doc["proxies"].([]any)
+	proxies := getSlice(t, doc, "proxies")
 	if len(proxies) != 2 {
 		t.Fatalf("expected 2 proxies, got %d", len(proxies))
 	}
 
-	// warp must have been appended.
 	if !hasProxy(proxies, "warp") {
 		t.Error("warp proxy was not appended")
 	}
@@ -309,40 +326,35 @@ rules:
 		t.Error("my-vless proxy was removed")
 	}
 
-	// Rules must be untouched — user manages them.
-	rules := doc["rules"].([]any)
+	rules := getSlice(t, doc, "rules")
 	if len(rules) != 2 {
 		t.Fatalf("rules count changed: got %d, want 2", len(rules))
 	}
-	if rules[1].(string) != "MATCH,my-vless" {
+	if getString(t, rules[1]) != "MATCH,my-vless" {
 		t.Errorf("rules[1] changed: got %q", rules[1])
 	}
 }
-
-// --- minimal template MATCH,DIRECT → MATCH,warp on warp enable ---
 
 func TestPatchReplacesMatchDirectWhenMinimalTemplate(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
 	cfg.Warp.Enabled = false
 
-	// First run with warp disabled — creates minimal template with MATCH,DIRECT.
 	if err := EnsureConfig(cfg, nil, [3]byte{}, testLog); err != nil {
 		t.Fatal(err)
 	}
 
-	// Enable warp — MATCH,DIRECT must become MATCH,warp.
 	cfg.Warp.Enabled = true
 	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err != nil {
 		t.Fatal(err)
 	}
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
-	rules := doc["rules"].([]any)
-	if len(rules) != 1 || rules[0].(string) != minimalTemplateWarpRule() {
+	rules := getSlice(t, doc, "rules")
+	if len(rules) != 1 || getString(t, rules[0]) != minimalTemplateWarpRule() {
 		t.Errorf("rules: got %v, want [%s]", rules, minimalTemplateWarpRule())
 	}
-	proxies := doc["proxies"].([]any)
+	proxies := getSlice(t, doc, "proxies")
 	if !hasProxy(proxies, "warp") {
 		t.Error("warp proxy not added")
 	}
@@ -352,7 +364,6 @@ func TestPatchDoesNotReplaceMatchDirectWhenUserHasCustomRules(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
 
-	// User config with custom rules and no warp proxy.
 	userConfig := `
 mixed-port: 7890
 log-level: info
@@ -374,62 +385,57 @@ rules:
 	}
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
-	rules := doc["rules"].([]any)
-	// 2 rules — not a minimal template, so rules must be untouched.
+	rules := getSlice(t, doc, "rules")
 	if len(rules) != 2 {
 		t.Fatalf("rules count changed: got %d, want 2", len(rules))
 	}
-	if rules[1].(string) != minimalTemplateDirectRule() {
+	if getString(t, rules[1]) != minimalTemplateDirectRule() {
 		t.Errorf("rules[1] changed: got %q", rules[1])
 	}
 }
-
-// --- rules[] are never modified on patch ---
 
 func TestPatchDoesNotModifyRules(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
 
-	// First run — creates template with MATCH,warp.
 	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err != nil {
 		t.Fatal(err)
 	}
 
-	// User manually edits rules.
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
 	doc["rules"] = []any{
 		"DOMAIN-SUFFIX,audit.example.com,DIRECT",
 		"GEOIP,CN,DIRECT",
 		"MATCH,AuditGroup",
 	}
-	data, _ := yaml.Marshal(doc) //nolint:errcheck // mock serialization
+	data, err := yaml.Marshal(doc)
+	if err != nil {
+		t.Fatalf("yaml.Marshal: %v", err)
+	}
 	if err := os.WriteFile(cfg.Paths.MihomoConfigFile, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Patch — rules must not change regardless of USE_WARP_CONFIG value.
 	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err != nil {
 		t.Fatal(err)
 	}
 
 	doc = readYAML(t, cfg.Paths.MihomoConfigFile)
-	rules := doc["rules"].([]any)
+	rules := getSlice(t, doc, "rules")
 
 	if len(rules) != 3 {
 		t.Fatalf("rules count changed: got %d, want 3", len(rules))
 	}
-	if rules[0].(string) != "DOMAIN-SUFFIX,audit.example.com,DIRECT" {
+	if getString(t, rules[0]) != "DOMAIN-SUFFIX,audit.example.com,DIRECT" {
 		t.Errorf("rules[0] changed: got %q", rules[0])
 	}
-	if rules[1].(string) != "GEOIP,CN,DIRECT" {
+	if getString(t, rules[1]) != "GEOIP,CN,DIRECT" {
 		t.Errorf("rules[1] changed: got %q", rules[1])
 	}
-	if rules[2].(string) != "MATCH,AuditGroup" {
+	if getString(t, rules[2]) != "MATCH,AuditGroup" {
 		t.Errorf("rules[2] changed: got %q", rules[2])
 	}
 }
-
-// --- Reserved bytes ---
 
 func TestReservedWrittenWhenNonZero(t *testing.T) {
 	dir := t.TempDir()
@@ -440,8 +446,8 @@ func TestReservedWrittenWhenNonZero(t *testing.T) {
 	}
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
-	proxies := doc["proxies"].([]any)
-	proxy, _ := proxies[0].(map[string]any)
+	proxies := getSlice(t, doc, "proxies")
+	proxy := getMap(t, proxies[0])
 
 	if proxy["reserved"] == nil {
 		t.Error("reserved not written when non-zero")
@@ -457,15 +463,13 @@ func TestReservedNotWrittenWhenZero(t *testing.T) {
 	}
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
-	proxies := doc["proxies"].([]any)
-	proxy, _ := proxies[0].(map[string]any)
+	proxies := getSlice(t, doc, "proxies")
+	proxy := getMap(t, proxies[0])
 
 	if proxy["reserved"] != nil {
 		t.Errorf("reserved written for zero value: %v", proxy["reserved"])
 	}
 }
-
-// --- Geo block ---
 
 func TestGeoBlockRemovedWhenDisabled(t *testing.T) {
 	dir := t.TempDir()
@@ -489,8 +493,6 @@ func TestGeoBlockRemovedWhenDisabled(t *testing.T) {
 	}
 }
 
-// --- Amnezia ---
-
 func TestAmneziaBlockAddedAndRemoved(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
@@ -499,6 +501,7 @@ func TestAmneziaBlockAddedAndRemoved(t *testing.T) {
 		JC:      5,
 		JMin:    7,
 		JMax:    15,
+		I:       [5]string{"1", "", "3", "", "5"},
 	}
 
 	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err != nil {
@@ -506,8 +509,8 @@ func TestAmneziaBlockAddedAndRemoved(t *testing.T) {
 	}
 
 	doc := readYAML(t, cfg.Paths.MihomoConfigFile)
-	proxies := doc["proxies"].([]any)
-	proxy, _ := proxies[0].(map[string]any)
+	proxies := getSlice(t, doc, "proxies")
+	proxy := getMap(t, proxies[0])
 
 	if proxy["amnezia-wg-option"] == nil {
 		t.Error("amnezia-wg-option not written when Amnezia enabled")
@@ -519,15 +522,13 @@ func TestAmneziaBlockAddedAndRemoved(t *testing.T) {
 	}
 
 	doc = readYAML(t, cfg.Paths.MihomoConfigFile)
-	proxies = doc["proxies"].([]any)
-	proxy, _ = proxies[0].(map[string]any)
+	proxies = getSlice(t, doc, "proxies")
+	proxy = getMap(t, proxies[0])
 
 	if proxy["amnezia-wg-option"] != nil {
 		t.Error("amnezia-wg-option still present after Amnezia disabled")
 	}
 }
-
-// --- splitEndpoint ---
 
 func TestSplitEndpoint(t *testing.T) {
 	cases := []struct {
@@ -551,8 +552,6 @@ func TestSplitEndpoint(t *testing.T) {
 		}
 	}
 }
-
-// --- findProxyByNameNode ---
 
 func TestFindProxyByNameNode(t *testing.T) {
 	makeNode := func(name string) *yaml.Node {
@@ -581,4 +580,277 @@ func TestFindProxyByNameNode(t *testing.T) {
 	if idx := findProxyByNameNode(emptySeq, "warp"); idx != -1 {
 		t.Errorf("findProxyByNameNode empty: got %d, want -1", idx)
 	}
+}
+
+func TestDocMappingAndYamlNodeNameEdgeCases(t *testing.T) {
+	if got := docMapping(&yaml.Node{Kind: yaml.ScalarNode}); got != nil {
+		t.Error("expected nil for non-DocumentNode")
+	}
+	if got := docMapping(&yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{}}); got != nil {
+		t.Error("expected nil for empty DocumentNode")
+	}
+	if got := docMapping(&yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.ScalarNode}}}); got != nil {
+		t.Error("expected nil for non-Mapping root inside DocumentNode")
+	}
+	mapNode := &yaml.Node{Kind: yaml.MappingNode}
+	if got := docMapping(mapNode); got != mapNode {
+		t.Error("expected direct MappingNode to return itself")
+	}
+	if got := yamlNodeName(nil); got != "" {
+		t.Error("expected empty string for nil node")
+	}
+	if got := yamlNodeName(&yaml.Node{Kind: yaml.ScalarNode}); got != "" {
+		t.Error("expected empty string for scalar node")
+	}
+	nodeWithoutName := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			strNode("other"),
+			strNode("value"),
+		},
+	}
+	if got := yamlNodeName(nodeWithoutName); got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+	host, port := splitEndpoint("badport.example.com:notaport")
+	if host != "badport.example.com" || port != 0 {
+		t.Errorf("splitEndpoint with bad port: got %s:%d", host, port)
+	}
+}
+
+func TestEnsureConfigWriteError(t *testing.T) {
+	cfg := &config.Config{
+		Paths: config.Paths{
+			MihomoConfigFile: "/nonexistent/path/for/config.yaml",
+		},
+	}
+	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err == nil {
+		t.Error("expected error writing to nonexistent path, got nil")
+	}
+}
+
+func TestPatchConfigOversized(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	data := bytes.Repeat([]byte("a"), maxConfigSize+10)
+	if err := os.WriteFile(cfg.Paths.MihomoConfigFile, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err == nil {
+		t.Error("expected error for oversized config, got nil")
+	}
+}
+
+func TestPatchConfigInvalidYAML(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	if err := os.WriteFile(cfg.Paths.MihomoConfigFile, []byte("invalid: [yaml:"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err == nil {
+		t.Error("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestPatchConfigNotMapping(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	if err := os.WriteFile(cfg.Paths.MihomoConfigFile, []byte("- item1\n- item2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err == nil {
+		t.Error("expected error for non-mapping YAML, got nil")
+	}
+}
+
+func TestEnsureConfigStatError(t *testing.T) {
+	dir := t.TempDir()
+	dummyFile := filepath.Join(dir, "not_a_directory")
+	if err := os.WriteFile(dummyFile, []byte("dummy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(dir)
+	cfg.Paths.MihomoConfigFile = filepath.Join(dummyFile, "config.yaml")
+	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err == nil {
+		t.Error("expected stat error for invalid path, got nil")
+	}
+}
+
+func TestWriteConfigErrors(t *testing.T) {
+	dir := t.TempDir()
+	dummyFile := filepath.Join(dir, "dummy_file")
+	if err := os.WriteFile(dummyFile, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	invalidPath := filepath.Join(dummyFile, "config.yaml")
+	if err := writeConfigNode(invalidPath, &yaml.Node{Kind: yaml.MappingNode}); err == nil {
+		t.Error("expected writeConfigNode error, got nil")
+	}
+	if err := writeConfigMap(invalidPath, map[string]any{"test": 1}); err == nil {
+		t.Error("expected writeConfigMap error, got nil")
+	}
+}
+
+func TestIsMinimalTemplateNode(t *testing.T) {
+	nonEmptyProxies := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			strNode("proxies"),
+			{Kind: yaml.SequenceNode, Content: []*yaml.Node{strNode("p1")}},
+		},
+	}
+	if isMinimalTemplateNode(nonEmptyProxies) {
+		t.Error("expected false when proxies is not empty")
+	}
+
+	noRules := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			strNode("proxies"),
+			{Kind: yaml.SequenceNode, Content: []*yaml.Node{}},
+		},
+	}
+	if isMinimalTemplateNode(noRules) {
+		t.Error("expected false when rules is missing")
+	}
+
+	scalarRules := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			strNode("rules"),
+			strNode("not-a-sequence"),
+		},
+	}
+	if isMinimalTemplateNode(scalarRules) {
+		t.Error("expected false when rules is not a sequence")
+	}
+
+	twoRules := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			strNode("rules"),
+			{Kind: yaml.SequenceNode, Content: []*yaml.Node{strNode("MATCH,DIRECT"), strNode("MATCH,warp")}},
+		},
+	}
+	if isMinimalTemplateNode(twoRules) {
+		t.Error("expected false when rules length is not 1")
+	}
+
+	otherRule := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			strNode("rules"),
+			{Kind: yaml.SequenceNode, Content: []*yaml.Node{strNode("MATCH,warp")}},
+		},
+	}
+	if isMinimalTemplateNode(otherRule) {
+		t.Error("expected false when rule is not MATCH,DIRECT")
+	}
+
+	validDirect := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			strNode("rules"),
+			{Kind: yaml.SequenceNode, Content: []*yaml.Node{strNode(minimalTemplateDirectRule())}},
+		},
+	}
+	if !isMinimalTemplateNode(validDirect) {
+		t.Error("expected true for valid minimal template direct rule")
+	}
+}
+
+func TestPatchConfigOpenError(t *testing.T) {
+	cfg := &config.Config{
+		Paths: config.Paths{
+			MihomoConfigFile: "/nonexistent/config.yaml",
+		},
+	}
+	if err := patchConfig(cfg, testProfile, testReserved, testLog); err == nil {
+		t.Error("expected open error, got nil")
+	}
+}
+
+func TestWriteConfigMarshalErrors(t *testing.T) {
+	origMarshal := yamlMarshal
+	defer func() { yamlMarshal = origMarshal }()
+	yamlMarshal = func(any) ([]byte, error) {
+		return nil, errors.New("mock marshal error")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.yaml")
+	if err := writeConfigNode(path, &yaml.Node{Kind: yaml.MappingNode}); err == nil || !strings.Contains(err.Error(), "marshal config") {
+		t.Errorf("expected writeConfigNode marshal error, got: %v", err)
+	}
+	if err := writeConfigMap(path, map[string]any{"a": 1}); err == nil || !strings.Contains(err.Error(), "marshal config") {
+		t.Errorf("expected writeConfigMap marshal error, got: %v", err)
+	}
+}
+
+func TestPatchConfigFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	if err := os.WriteFile(cfg.Paths.MihomoConfigFile, []byte("port: 7890\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origClose := fileClose
+	defer func() { fileClose = origClose }()
+	fileClose = func(*os.File) error {
+		return errors.New("mock close error")
+	}
+	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err == nil || !strings.Contains(err.Error(), "close config") {
+		t.Errorf("expected close config error, got: %v", err)
+	}
+	fileClose = origClose
+
+	origRead := fileReadAll
+	defer func() { fileReadAll = origRead }()
+	fileReadAll = func(io.Reader) ([]byte, error) {
+		return nil, errors.New("mock read error")
+	}
+	if err := EnsureConfig(cfg, testProfile, testReserved, testLog); err == nil || !strings.Contains(err.Error(), "read config") {
+		t.Errorf("expected read config error, got: %v", err)
+	}
+}
+
+func TestDefaultHelpers(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "mihomo_helper_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr := defaultFileClose(f); closeErr != nil {
+		t.Errorf("defaultFileClose failed: %v", closeErr)
+	}
+	if closeErr := defaultFileClose(f); closeErr == nil {
+		t.Error("expected error on double close, got nil")
+	}
+
+	b, readErr := defaultFileReadAll(strings.NewReader("content"))
+	if readErr != nil || string(b) != "content" {
+		t.Errorf("defaultFileReadAll unexpected result: %s, %v", string(b), readErr)
+	}
+	if _, readFailErr := defaultFileReadAll(errReader{}); readFailErr == nil {
+		t.Error("expected error on errReader, got nil")
+	}
+
+	data, marshalErr := defaultYAMLMarshal(map[string]string{"key": "val"})
+	if marshalErr != nil || len(data) == 0 {
+		t.Errorf("defaultYAMLMarshal unexpected result: %s, %v", string(data), marshalErr)
+	}
+	if _, marshalFailErr := defaultYAMLMarshal(badMarshaler{}); marshalFailErr == nil {
+		t.Error("expected error for unmarshalable type, got nil")
+	}
+}
+
+type badMarshaler struct{}
+
+func (badMarshaler) MarshalYAML() (any, error) {
+	return nil, errors.New("custom marshal error")
+}
+
+type errReader struct{}
+
+func (errReader) Read(_ []byte) (int, error) {
+	return 0, errors.New("simulated read failure")
 }

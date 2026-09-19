@@ -3,20 +3,59 @@
 package fsutil
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
-// atomicFinish syncs, closes and renames the temp file to the final destination.
-func atomicFinish(f *os.File, tmpName, dst string) error {
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync temp file: %w", err)
-	}
+func defaultTempFileClose(f *os.File) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
+	return nil
+}
+
+func defaultTempFileSync(f *os.File) error {
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	return nil
+}
+
+func defaultTempFileChmod(f *os.File, perm os.FileMode) error {
+	if err := f.Chmod(perm); err != nil {
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	return nil
+}
+
+func defaultTempFileWrite(f *os.File, b []byte) (int, error) {
+	n, err := f.Write(b)
+	if err != nil {
+		return n, fmt.Errorf("write data: %w", err)
+	}
+	return n, nil
+}
+
+var (
+	osRename      = os.Rename
+	osRemove      = os.Remove
+	osCreateTemp  = os.CreateTemp
+	tempFileClose = defaultTempFileClose
+	tempFileSync  = defaultTempFileSync
+	tempFileChmod = defaultTempFileChmod
+	tempFileWrite = defaultTempFileWrite
+)
+
+func atomicFinish(f *os.File, tmpName, dst string) error {
+	if err := tempFileSync(f); err != nil {
+		return err
+	}
+	if err := tempFileClose(f); err != nil {
+		return err
+	}
+	if err := osRename(tmpName, dst); err != nil {
 		return fmt.Errorf("rename to destination: %w", err)
 	}
 	return nil
@@ -24,21 +63,21 @@ func atomicFinish(f *os.File, tmpName, dst string) error {
 
 func createAtomicTemp(dst string, perm os.FileMode) (*os.File, string, error) {
 	dir := filepath.Dir(dst)
-	f, err := os.CreateTemp(dir, filepath.Base(dst)+".*")
+	f, err := osCreateTemp(dir, filepath.Base(dst)+".*")
 	if err != nil {
 		return nil, "", fmt.Errorf("create temp file: %w", err)
 	}
 	tmpName := f.Name()
-	if err := f.Chmod(perm); err != nil {
-		_ = f.Close()          //nolint:errcheck // cleanup on error
-		_ = os.Remove(tmpName) //nolint:errcheck // cleanup on error
-		return nil, "", fmt.Errorf("chmod temp file: %w", err)
+	if err := tempFileChmod(f, perm); err != nil {
+		closeErr := tempFileClose(f)
+		removeErr := osRemove(tmpName)
+		return nil, "", errors.Join(err, closeErr, removeErr)
 	}
 	return f, tmpName, nil
 }
 
 // AtomicWrite writes data to filename atomically.
-func AtomicWrite(filename string, data []byte, perm os.FileMode) error {
+func AtomicWrite(filename string, data []byte, perm os.FileMode) (retErr error) {
 	f, tmpName, err := createAtomicTemp(filename, perm)
 	if err != nil {
 		return err
@@ -46,31 +85,31 @@ func AtomicWrite(filename string, data []byte, perm os.FileMode) error {
 	done := false
 	defer func() {
 		if !done {
-			_ = f.Close()          //nolint:errcheck // cleanup on failure
-			_ = os.Remove(tmpName) //nolint:errcheck // cleanup on failure
+			closeErr := tempFileClose(f)
+			removeErr := osRemove(tmpName)
+			retErr = errors.Join(retErr, closeErr, removeErr)
 		}
 	}()
 
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("write data: %w", err)
+	if _, writeErr := tempFileWrite(f, data); writeErr != nil {
+		return writeErr
 	}
-	if err := atomicFinish(f, tmpName, filename); err != nil {
-		return err
+	if finishErr := atomicFinish(f, tmpName, filename); finishErr != nil {
+		return finishErr
 	}
 	done = true
 	return nil
 }
 
 // IsDirWritable probes write access to dir by attempting to create and
-// immediately remove a temporary file. This is the only reliable cross-platform
-// method — permission bits alone do not account for ACLs, read-only mounts,
-// or quota exhaustion.
+// immediately remove a temporary file.
 func IsDirWritable(dir string) bool {
-	f, err := os.CreateTemp(dir, ".write_probe_*.tmp")
+	f, err := osCreateTemp(dir, ".write_probe_*.tmp")
 	if err != nil {
 		return false
 	}
-	_ = f.Close()           //nolint:errcheck // probe cleanup
-	_ = os.Remove(f.Name()) //nolint:errcheck // probe cleanup
-	return true
+	name := f.Name()
+	closeErr := tempFileClose(f)
+	removeErr := osRemove(name)
+	return closeErr == nil && removeErr == nil
 }

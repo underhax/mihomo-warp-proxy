@@ -55,7 +55,6 @@ type GeoConfig struct {
 // JMin and JMax are only meaningful when Enabled is true; the validator
 // enforces 0 <= JMin < JMax <= 1280 as required by the AmneziaWG spec.
 type AmneziaConfig struct {
-	// I1–I5 are AmneziaWG v2 init packet templates. Empty string means unused.
 	I       [5]string
 	JC      int
 	JMin    int
@@ -65,11 +64,8 @@ type AmneziaConfig struct {
 
 // WarpConfig controls Cloudflare WARP provisioning via wgcf.
 type WarpConfig struct {
-	// DNS is the parsed, validated list of DNS resolvers injected into the
-	// mihomo WireGuard proxy block. Supports IPv4, IPv6, DoT, DoH, DoQ.
-	DNS     []string
-	PlusKey string
-	// Endpoint is the validated "host:port" string for the WARP UDP endpoint.
+	DNS        []string
+	PlusKey    string
 	Endpoint   string
 	Amnezia    AmneziaConfig
 	Enabled    bool
@@ -95,8 +91,7 @@ type Config struct {
 	UseIP6        bool
 }
 
-// defaultPaths returns the fixed filesystem layout baked into the image.
-func defaultPaths() Paths {
+func defaultGetPaths() Paths {
 	return Paths{
 		MihomoData:       "/app/mihomo",
 		MihomoConfigFile: "/app/mihomo/config.yaml",
@@ -110,12 +105,14 @@ func defaultPaths() Paths {
 	}
 }
 
+var getPaths = defaultGetPaths
+
 // Load reads all environment variables, applies defaults, and validates values.
 // It returns a fully populated Config or an error describing the first
 // validation failure. It never calls os.Exit.
 func Load(version string) (*Config, error) {
 	cfg := &Config{
-		Paths:   defaultPaths(),
+		Paths:   getPaths(),
 		Version: version,
 	}
 
@@ -192,7 +189,6 @@ func Load(version string) (*Config, error) {
 	return cfg, nil
 }
 
-// loadGeoConfig parses all GEO_* environment variables.
 func loadGeoConfig() (GeoConfig, error) {
 	var (
 		g   GeoConfig
@@ -235,7 +231,6 @@ func loadGeoConfig() (GeoConfig, error) {
 	g.AuthUser = getEnv(contract.EnvGeoAuthUser, "")
 	g.AuthPass = getEnv(contract.EnvGeoAuthSecret, "")
 
-	// Both or neither — a partial credential pair is a misconfiguration.
 	if (g.AuthUser == "") != (g.AuthPass == "") {
 		return g, errors.New(contract.EnvGeoAuthUser + " and " + contract.EnvGeoAuthSecret + " must both be set or both be empty")
 	}
@@ -252,7 +247,6 @@ func loadGeoConfig() (GeoConfig, error) {
 	return g, nil
 }
 
-// loadWarpConfig parses all WARP_* environment variables.
 func loadWarpConfig() (WarpConfig, error) {
 	var w WarpConfig
 
@@ -297,7 +291,6 @@ func loadWarpConfig() (WarpConfig, error) {
 	return w, nil
 }
 
-// loadAmneziaConfig parses all WARP_AMNEZIA_* environment variables.
 func loadAmneziaConfig() (AmneziaConfig, error) {
 	var (
 		a   AmneziaConfig
@@ -328,7 +321,6 @@ func loadAmneziaConfig() (AmneziaConfig, error) {
 		return a, err
 	}
 
-	// Cross-field constraint: jmin must be strictly less than jmax.
 	if a.JMin >= a.JMax {
 		return a, fmt.Errorf("%s (%d) must be less than %s (%d)", contract.EnvWarpAmneziaJMin, a.JMin, contract.EnvWarpAmneziaJMax, a.JMax)
 	}
@@ -440,9 +432,6 @@ func validateProxyLogLevel(v string) error {
 	}
 }
 
-// validateCredentialPair enforces that both PROXY_USER and PROXY_PASS are
-// always set. An unauthenticated proxy is a security risk — anonymous access
-// is not permitted regardless of network topology.
 func validateCredentialPair(user, pass string) error {
 	userSet := user != ""
 	passSet := pass != ""
@@ -473,9 +462,6 @@ func validateCredentialPair(user, pass string) error {
 	return validatePasswordComplexity(pass)
 }
 
-// validateMinLength enforces a minimum length for proxy credentials.
-// Short credentials are trivially brute-forced; 32 characters for the
-// password matches the minimum output of `pwgen -s 32 1`.
 func validateMinLength(name, value string, minVal int) error {
 	if len(value) < minVal {
 		return fmt.Errorf("%s: minimum length is %d characters, got %d", name, minVal, len(value))
@@ -483,35 +469,33 @@ func validateMinLength(name, value string, minVal int) error {
 	return nil
 }
 
-// validateCredential enforces length and character constraints on a single
-// credential string. The colon restriction exists because HTTP Basic Auth
-// encodes credentials as "user:pass" — a colon in the username would
-// corrupt the boundary. Shell metacharacters and spaces are rejected to ensure
-// safe interpolation in the Docker healthcheck CMD-SHELL — pwgen -s never
-// produces these characters so legitimate credentials are unaffected.
-func validateCredential(name, value string, maxLen int) error { //nolint:gocyclo // flat logic, splitting reduces readability
+func validateCredential(name, value string, maxLen int) error {
 	if len(value) > maxLen {
 		return fmt.Errorf("%s: value too long (max %d characters, got %d)", name, maxLen, len(value))
 	}
 	for i, r := range value {
-		switch {
-		case r == ':':
-			return fmt.Errorf("%s: colon not allowed (position %d)", name, i)
-		case r == '$' || r == '`' || r == '"' || r == '\'' || r == '\\' ||
-			r == '!' || r == '&' || r == ';' || r == '|' || r == '<' || r == '>' || r == ' ':
-			return fmt.Errorf("%s: shell metacharacter or space %q not allowed (position %d)", name, r, i)
-		case r < 0x20 || r == 0x7f:
-			return fmt.Errorf("%s: control character not allowed (position %d, value 0x%02x)", name, i, r)
-		case r == 0x00:
-			return fmt.Errorf("%s: null byte not allowed (position %d)", name, i)
+		if err := checkCredentialRune(name, i, r); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// passwordRequirements is the human-readable description of all PROXY_PASS
-// constraints. Shown in full on any complexity failure so the user knows
-// exactly what is required rather than discovering rules one by one.
+func checkCredentialRune(name string, i int, r rune) error {
+	switch {
+	case r == ':':
+		return fmt.Errorf("%s: colon not allowed (position %d)", name, i)
+	case strings.ContainsRune("$`\"'\\!&;|<> ", r):
+		return fmt.Errorf("%s: shell metacharacter or space %q not allowed (position %d)", name, r, i)
+	case r == 0x00:
+		return fmt.Errorf("%s: null byte not allowed (position %d)", name, i)
+	case r < 0x20 || r == 0x7f:
+		return fmt.Errorf("%s: control character not allowed (position %d, value 0x%02x)", name, i, r)
+	default:
+		return nil
+	}
+}
+
 const passwordRequirements = contract.EnvProxyPass + " requirements: " +
 	"min 32 characters; " +
 	"at least one uppercase letter (A-Z); " +
@@ -522,23 +506,24 @@ const passwordRequirements = contract.EnvProxyPass + " requirements: " +
 	`no spaces or shell metacharacters ($, ` + "`" + `, ", ', \, !, &, ;, |, <, >). ` +
 	"Generate with: pwgen -s 128 1"
 
-// validatePasswordComplexity enforces strength requirements for PROXY_PASS.
-// All rules are evaluated together and a single message listing every
-// requirement is returned on failure — the user is never left guessing which
-// rule they violated.
-//
-// Rules (compatible with `pwgen -s` output):
-//   - At least one uppercase letter (A-Z)
-//   - At least one lowercase letter (a-z)
-//   - At least one decimal digit (0-9)
-//   - No run of more than 3 identical consecutive characters
-//   - At least 12 distinct characters (prevents e.g. aaaa...A1)
-func validatePasswordComplexity(pass string) error { //nolint:gocyclo // linear validation, splitting reduces readability
-	var hasUpper, hasLower, hasDigit bool
-	unique := make(map[rune]struct{})
+func hasConsecutiveRun(runes []rune) bool {
+	for i := 3; i < len(runes); i++ {
+		if runes[i] == runes[i-1] && runes[i-1] == runes[i-2] && runes[i-2] == runes[i-3] {
+			return true
+		}
+	}
+	return false
+}
 
+func validatePasswordComplexity(pass string) error {
 	runes := []rune(pass)
-	for i, r := range runes {
+	if hasConsecutiveRun(runes) {
+		return errors.New(passwordRequirements)
+	}
+
+	var hasUpper, hasLower, hasDigit bool
+	unique := make(map[rune]struct{}, len(runes))
+	for _, r := range runes {
 		switch {
 		case r >= 'A' && r <= 'Z':
 			hasUpper = true
@@ -548,23 +533,14 @@ func validatePasswordComplexity(pass string) error { //nolint:gocyclo // linear 
 			hasDigit = true
 		}
 		unique[r] = struct{}{}
-
-		// Run detection: 4 or more identical consecutive characters.
-		if i >= 3 && runes[i] == runes[i-1] && runes[i] == runes[i-2] && runes[i] == runes[i-3] {
-			return fmt.Errorf("%s", passwordRequirements)
-		}
 	}
 
 	if !hasUpper || !hasLower || !hasDigit || len(unique) < 12 {
-		return fmt.Errorf("%s", passwordRequirements)
+		return errors.New(passwordRequirements)
 	}
 	return nil
 }
 
-// validateWarpEndpoint checks that the endpoint is "engage.cloudflareclient.com:PORT"
-// where PORT is one of the four UDP ports supported by Cloudflare WARP.
-// Restricting to a single hostname prevents the WARP credentials from being
-// sent to an attacker-controlled endpoint.
 func validateWarpEndpoint(endpoint string) error {
 	lastColon := strings.LastIndex(endpoint, ":")
 	if lastColon < 0 {
@@ -584,7 +560,6 @@ func validateWarpEndpoint(endpoint string) error {
 	return nil
 }
 
-// parseDNSList splits a comma-separated DNS string and validates each entry.
 func parseDNSList(raw string) ([]string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, errors.New(contract.EnvWarpDNS + ": must not be empty")
@@ -614,8 +589,6 @@ func parseDNSList(raw string) ([]string, error) {
 	return result, nil
 }
 
-// isValidDNSEntry returns true for IPv4 addresses, IPv6 addresses, and the
-// encrypted DNS URI schemes supported by mihomo (DoT, DoH, DoQ).
 func isValidDNSEntry(s string) bool {
 	switch {
 	case strings.HasPrefix(s, "tls://"):
@@ -641,8 +614,6 @@ func isHexOrColon(r rune) bool {
 		(r >= 'A' && r <= 'F') || r == ':'
 }
 
-// isIPv4 performs a strict four-octet validation without using net.ParseIP so
-// that the config package has no dependency on the network stack.
 func isIPv4(s string) bool {
 	parts := strings.Split(s, ".")
 	if len(parts) != 4 {
@@ -667,8 +638,6 @@ func validateTZ(tz string) error {
 	return nil
 }
 
-// warpPlusKeyRe matches the Cloudflare WARP+ license key format:
-// four groups of 8 hex characters separated by hyphens.
 var warpPlusKeyRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}$`)
 
 func validateWarpPlusKey(key string) error {
@@ -685,8 +654,6 @@ func validateGeoURL(name, rawURL string) error {
 	return nil
 }
 
-// validateGeoCredential enforces character constraints on GEO auth credentials.
-// Prevents injection via HTTP Basic Auth headers and URL embedding.
 func validateGeoCredential(name, value string) error {
 	if len(value) > 256 {
 		return fmt.Errorf("%s: value too long (max 256 characters, got %d)", name, len(value))
@@ -714,9 +681,6 @@ func FilterEnviron(environ []string) []string {
 	for _, e := range environ {
 		if key, _, ok := strings.Cut(e, "="); ok {
 			switch key {
-			// Proxy credentials, WARP+ license key, and geo auth must never
-			// reach child processes — they have no need for these values and
-			// exposing them would increase the attack surface.
 			case contract.EnvProxyPass, contract.EnvGeoAuthUser, contract.EnvGeoAuthSecret, contract.EnvWarpPlusKey:
 				continue
 			}
@@ -726,8 +690,6 @@ func FilterEnviron(environ []string) []string {
 	return clean
 }
 
-// validatePaths ensures all core filesystem locations pass security boundaries,
-// providing defense-in-depth if these paths ever become user-configurable.
 func validatePaths(p *Paths) error {
 	paths := []struct {
 		name string

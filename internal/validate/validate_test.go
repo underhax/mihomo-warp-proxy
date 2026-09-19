@@ -1,11 +1,12 @@
 package validate
 
 import (
+	"context"
+	"errors"
 	"net"
+	"strings"
 	"testing"
 )
-
-// --- Path ---
 
 func TestPath(t *testing.T) {
 	cases := []struct {
@@ -33,7 +34,8 @@ func TestPath(t *testing.T) {
 		{"exact proc without trailing slash", "/proc", true},
 		{"exact sys without trailing slash", "/sys", true},
 		{"valid path sharing prefix", "/process/data", false},
-		{"path too long", "/" + string(make([]byte, 4097)), true},
+		{"valid dir trailing slash", "/var/log/", false},
+		{"path too long", "/" + strings.Repeat("a", 4097), true},
 	}
 
 	for _, tc := range cases {
@@ -49,29 +51,18 @@ func TestPath(t *testing.T) {
 	}
 }
 
-// --- IsRestrictedIP ---
-
 func TestIsRestrictedIP(t *testing.T) {
 	restricted := []string{
-		// loopback
 		"127.0.0.1", "127.255.255.255",
-		// RFC 1918
 		"10.0.0.1", "10.255.255.255",
 		"172.16.0.1", "172.31.255.255",
 		"192.168.0.1", "192.168.255.255",
-		// CGNAT
 		"100.64.0.1", "100.127.255.255",
-		// link-local
 		"169.254.0.1", "169.254.255.255",
-		// unspecified
 		"0.0.0.0",
-		// IPv6 loopback
 		"::1",
-		// IPv6 link-local
 		"fe80::1",
-		// IPv6 ULA
 		"fc00::1", "fd00::1",
-		// IPv4-mapped IPv6 pointing at RFC1918
 		"::ffff:192.168.1.1",
 		"::ffff:10.0.0.1",
 	}
@@ -79,10 +70,10 @@ func TestIsRestrictedIP(t *testing.T) {
 	allowed := []string{
 		"1.1.1.1",
 		"8.8.8.8",
-		"104.16.0.1",    // Cloudflare public range
-		"162.159.200.1", // Cloudflare public range
+		"104.16.0.1",
+		"162.159.200.1",
 		"2606:4700:4700::1111",
-		"2001:4860:4860::8888", // Google public DNS
+		"2001:4860:4860::8888",
 	}
 
 	for _, addr := range restricted {
@@ -111,8 +102,6 @@ func TestIsRestrictedIPNil(t *testing.T) {
 		t.Error("IsRestrictedIP(nil) = false, want true")
 	}
 }
-
-// --- AmneziaIParam ---
 
 func TestAmneziaIParam(t *testing.T) {
 	cases := []struct {
@@ -157,8 +146,6 @@ func TestAmneziaIParam(t *testing.T) {
 	}
 }
 
-// --- validateHex ---
-
 func TestValidateHex(t *testing.T) {
 	valid := []string{"deadbeef", "DEADBEEF", "DeAdBeEf", "00", "ff", "0123456789abcdefABCDEF"}
 	invalid := []string{"", "xyz", "dead beef", "0xdeadbeef", "gg"}
@@ -175,8 +162,6 @@ func TestValidateHex(t *testing.T) {
 	}
 }
 
-// --- truncate ---
-
 func TestTruncate(t *testing.T) {
 	short := "hello"
 	if truncate(short) != short {
@@ -185,7 +170,99 @@ func TestTruncate(t *testing.T) {
 
 	long := string(make([]byte, 100))
 	result := truncate(long)
-	if len([]rune(result)) > 82 { // 80 chars + ellipsis rune
+	if len([]rune(result)) > 82 {
 		t.Errorf("truncate did not shorten long string, got length %d", len(result))
+	}
+}
+
+var errMockLookup = errors.New("host not found")
+
+func mockLookupHost(_ context.Context, host string) ([]string, error) {
+	switch host {
+	case "example.com", "sub.example.com":
+		return []string{"93.184.215.14"}, nil
+	case "localhost":
+		return []string{"127.0.0.1"}, nil
+	case "empty.example.com":
+		return []string{}, nil
+	case "malformed.example.com":
+		return []string{"not-an-ip"}, nil
+	default:
+		return nil, errMockLookup
+	}
+}
+
+func TestResolveAndValidate(t *testing.T) {
+	origLookup := lookupHost
+	lookupHost = mockLookupHost
+	t.Cleanup(func() {
+		lookupHost = origLookup
+	})
+
+	cases := []struct {
+		name    string
+		host    string
+		wantErr bool
+	}{
+		{
+			name:    "public domain resolves to public IP",
+			host:    "example.com",
+			wantErr: false,
+		},
+		{
+			name:    "subdomain resolves to public IP",
+			host:    "sub.example.com",
+			wantErr: false,
+		},
+		{
+			name:    "localhost rejected",
+			host:    "localhost",
+			wantErr: true,
+		},
+		{
+			name:    "nonexistent domain rejected",
+			host:    "invalid.example.com",
+			wantErr: true,
+		},
+		{
+			name:    "empty address list rejected",
+			host:    "empty.example.com",
+			wantErr: true,
+		},
+		{
+			name:    "malformed IP rejected",
+			host:    "malformed.example.com",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ResolveAndValidate(tc.host)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for host %q, got nil", tc.host)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error for host %q: %v", tc.host, err)
+			}
+		})
+	}
+}
+
+func TestParseTagInt(t *testing.T) {
+	if err := parseTagInt("", 0, 10); err == nil {
+		t.Error("expected error for empty string, got nil")
+	}
+	if err := parseTagInt("abc", 0, 10); err == nil {
+		t.Error("expected error for non-number, got nil")
+	}
+}
+
+func TestIsRestrictedIPMore(t *testing.T) {
+	if !IsRestrictedIP(net.ParseIP("100.64.0.1")) {
+		t.Error("CGNAT IP should be restricted")
+	}
+	if !IsRestrictedIP(net.ParseIP("fec0::1")) {
+		t.Error("site-local IPv6 should be restricted")
 	}
 }

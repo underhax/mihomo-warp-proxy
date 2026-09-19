@@ -1,3 +1,5 @@
+FROM virb3/wgcf:2.3.0@sha256:eaf968a478cca813285a36aaaaa5b036ddce8d6671be1ba71e3e3281045201f0 AS wgcf
+FROM metacubex/mihomo:v1.19.31@sha256:739edd73a352d6beb82fad6790ef9d417a4d6f061584cc3cab1bd4536d1c60e5 AS mihomo
 FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.24@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS go-builder
 
 ARG TARGETOS
@@ -15,64 +17,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -o /entrypoint \
     ./cmd/entrypoint/
 
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS bin-builder
-
-SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
-
-# hadolint ignore=DL3018
-RUN apk add --no-cache ca-certificates wget jq
-
-ARG TARGETARCH
-ARG MIHOMO_VERSION
-ARG WGCF_VERSION
-ARG MIHOMO_CPU_VARIANT=v1
-
-RUN WGCF_RELEASE_VERSION="${WGCF_VERSION#v}"; \
-    if [ -z "${WGCF_RELEASE_VERSION}" ]; then \
-        WGCF_RELEASE_VERSION="$(wget -q -O - "https://api.github.com/repos/ViRb3/wgcf/releases/latest" | jq -er '.tag_name | ltrimstr("v")')"; \
-    fi; \
-    case "${WGCF_RELEASE_VERSION}" in \
-        ""|*[!0-9A-Za-z._-]*) echo "ERROR: invalid wgcf version" >&2; exit 1 ;; \
-    esac; \
-    case "${TARGETARCH}" in \
-        amd64|arm64) ;; \
-        *) echo "ERROR: unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    WGCF_FILE="wgcf_${WGCF_RELEASE_VERSION}_linux_${TARGETARCH}"; \
-    WGCF_DIGEST="$(wget -q -O - "https://api.github.com/repos/ViRb3/wgcf/releases/tags/v${WGCF_RELEASE_VERSION}" | jq -er --arg file "${WGCF_FILE}" '[.assets[] | select(.name == $file) | .digest] | if length == 1 then .[0] else error("expected exactly one matching asset digest") end')"; \
-    WGCF_SHA256="${WGCF_DIGEST#sha256:}"; \
-    printf '%s\n' "${WGCF_SHA256}" | grep -Eq '^[a-f0-9]{64}$' || { echo "ERROR: invalid wgcf SHA-256 digest" >&2; exit 1; }; \
-    wget -q -O /tmp/wgcf "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_RELEASE_VERSION}/${WGCF_FILE}"; \
-    printf '%s  %s\n' "${WGCF_SHA256}" /tmp/wgcf | sha256sum -c -; \
-    chmod 0555 /tmp/wgcf
-
-RUN MIHOMO_RELEASE_VERSION="${MIHOMO_VERSION#v}"; \
-    if [ -z "${MIHOMO_RELEASE_VERSION}" ]; then \
-        MIHOMO_RELEASE_VERSION="$(wget -q -O - "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | jq -er '.tag_name | ltrimstr("v")')"; \
-    fi; \
-    case "${MIHOMO_RELEASE_VERSION}" in \
-        ""|*[!0-9A-Za-z._-]*) echo "ERROR: invalid mihomo version" >&2; exit 1 ;; \
-    esac; \
-    case "${TARGETARCH}" in \
-        amd64) \
-            case "${MIHOMO_CPU_VARIANT}" in \
-                v1|v2|v3) ;; \
-                *) echo "ERROR: invalid mihomo CPU variant: ${MIHOMO_CPU_VARIANT}" >&2; exit 1 ;; \
-            esac; \
-            MIHOMO_FILE="mihomo-linux-amd64-${MIHOMO_CPU_VARIANT}-v${MIHOMO_RELEASE_VERSION}.gz" \
-            ;; \
-        arm64) MIHOMO_FILE="mihomo-linux-arm64-v${MIHOMO_RELEASE_VERSION}.gz" ;; \
-        *) echo "ERROR: unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    MIHOMO_DIGEST="$(wget -q -O - "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/v${MIHOMO_RELEASE_VERSION}" | jq -er --arg file "${MIHOMO_FILE}" '[.assets[] | select(.name == $file) | .digest] | if length == 1 then .[0] else error("expected exactly one matching asset digest") end')"; \
-    MIHOMO_SHA256="${MIHOMO_DIGEST#sha256:}"; \
-    printf '%s\n' "${MIHOMO_SHA256}" | grep -Eq '^[a-f0-9]{64}$' || { echo "ERROR: invalid mihomo SHA-256 digest" >&2; exit 1; }; \
-    wget -q -O /tmp/mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_RELEASE_VERSION}/${MIHOMO_FILE}"; \
-    printf '%s  %s\n' "${MIHOMO_SHA256}" /tmp/mihomo.gz | sha256sum -c -; \
-    gunzip /tmp/mihomo.gz; \
-    chmod 0555 /tmp/mihomo
-
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.24.2@sha256:31b6477333eb8257db9e5d7c3a7264fd0467928756f0bbcc27d35bea5d28cdbd
 
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
@@ -90,8 +35,8 @@ RUN apk add --no-cache \
     && adduser -u 911 -D -S -G mihomo mihomo
 
 COPY --from=go-builder /entrypoint /usr/local/bin/entrypoint
-COPY --from=bin-builder /tmp/wgcf /usr/local/bin/wgcf
-COPY --from=bin-builder /tmp/mihomo /usr/local/bin/mihomo
+COPY --from=wgcf /wgcf /usr/local/bin/wgcf
+COPY --from=mihomo /mihomo /usr/local/bin/mihomo
 
 RUN chmod 0555 /usr/local/bin/entrypoint \
                /usr/local/bin/mihomo \

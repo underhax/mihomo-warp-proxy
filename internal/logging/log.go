@@ -4,8 +4,10 @@ package logging
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -34,12 +36,6 @@ type Logger struct {
 	pid     int
 }
 
-// logHandler is a custom slog.Handler that produces the fixed-format output:
-//
-//	2006-01-02T15:04:05Z [LEVEL] [PID] message (vVERSION)
-//
-// slog's built-in handlers (Text, JSON) cannot produce this exact line structure,
-// so we implement the interface directly rather than wrapping an existing handler.
 type logHandler struct {
 	version string
 	level   slog.Level
@@ -50,7 +46,13 @@ func (h *logHandler) Enabled(_ context.Context, l slog.Level) bool {
 	return l >= h.level
 }
 
-func (h *logHandler) Handle(_ context.Context, r slog.Record) error { //nolint:gocritic // signature required by slog.Handler interface
+func defaultLogWriter() io.Writer {
+	return os.Stderr
+}
+
+var logWriter = defaultLogWriter
+
+func (h *logHandler) Handle(_ context.Context, r slog.Record) error {
 	ts := r.Time.UTC().Format("2006-01-02T15:04:05Z")
 	levelStr := levelName(r.Level)
 
@@ -60,20 +62,16 @@ func (h *logHandler) Handle(_ context.Context, r slog.Record) error { //nolint:g
 	line := fmt.Sprintf("%s [%s] [%d] %s (v%s)\n",
 		ts, levelStr, h.pid, msg, h.version)
 
-	_, err := os.Stderr.WriteString(line)
+	_, err := io.WriteString(logWriter(), line)
 	if err != nil {
 		return fmt.Errorf("write log line: %w", err)
 	}
 	return nil
 }
 
-// WithAttrs and WithGroup satisfy the slog.Handler interface.
-// Attributes and groups are not used in this logger's output format —
-// all contextual information is embedded in the message at call sites.
 func (h *logHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
 func (h *logHandler) WithGroup(_ string) slog.Handler      { return h }
 
-// levelName returns the uppercase level string used in log output.
 func levelName(l slog.Level) string {
 	switch l {
 	case slog.LevelDebug:
@@ -135,7 +133,9 @@ func (l *Logger) log(level slog.Level, msg string) {
 		return
 	}
 	r := slog.NewRecord(time.Now(), level, msg, 0)
-	_ = l.handler.Handle(context.Background(), r) //nolint:errcheck // log writes are fire-and-forget
+	if err := l.handler.Handle(context.Background(), r); err != nil {
+		return
+	}
 }
 
 // Debug logs at DEBUG level. Use for verbose diagnostic output that is
@@ -171,17 +171,19 @@ func (l *Logger) Errorf(format string, args ...any) {
 	l.log(LevelError, fmt.Sprintf(format, args...))
 }
 
+var osExit = os.Exit
+
 // Fatal logs at ERROR level then exits with code 1.
 // Use only in main — library packages must return errors instead.
 func (l *Logger) Fatal(msg string) {
 	l.log(LevelError, msg)
-	os.Exit(1)
+	osExit(1)
 }
 
 // Fatalf formats, logs at ERROR level, then exits with code 1.
 func (l *Logger) Fatalf(format string, args ...any) {
 	l.log(LevelError, fmt.Sprintf(format, args...))
-	os.Exit(1)
+	osExit(1)
 }
 
 // Level returns the minimum level at which this logger emits output.
@@ -199,8 +201,7 @@ func VersionFromFile(path string) string {
 }
 
 func readSafeVersion(path string) (string, bool) {
-	// #nosec G304 -- The path is a fixed constant (cfg.Paths.VersionFile).
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return "", false
 	}

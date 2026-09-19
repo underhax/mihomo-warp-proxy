@@ -1,18 +1,27 @@
 package geo
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
+	"github.com/underhax/mihomo-warp-proxy/internal/logging"
 )
 
-// --- validateGeoURL ---
-
 func TestValidateGeoURL(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
 	cases := []struct {
 		name    string
 		url     string
@@ -35,13 +44,9 @@ func TestValidateGeoURL(t *testing.T) {
 			if tc.wantErr && err == nil {
 				t.Errorf("expected error for %q, got nil", tc.url)
 			}
-			// For cases we expect to pass: only run if wantErr is false.
-			// Live DNS validation is covered by the integration test.
 		})
 	}
 }
-
-// --- resolveRedirect ---
 
 func TestResolveRedirect(t *testing.T) {
 	cases := []struct {
@@ -109,8 +114,6 @@ func TestResolveRedirect(t *testing.T) {
 	}
 }
 
-// --- serializeMeta ---
-
 func TestSerializeMeta(t *testing.T) {
 	h := http.Header{}
 	h.Set("Etag", `"abc123"`)
@@ -121,21 +124,16 @@ func TestSerializeMeta(t *testing.T) {
 		t.Error("serializeMeta returned empty string")
 	}
 
-	// Same headers must produce identical output (determinism required for
-	// cache comparison).
 	if got != serializeMeta(h) {
 		t.Error("serializeMeta is not deterministic")
 	}
 
-	// Different headers must produce different output.
 	h2 := http.Header{}
 	h2.Set("Etag", `"different"`)
 	if got == serializeMeta(h2) {
 		t.Error("serializeMeta returned same result for different headers")
 	}
 }
-
-// --- metaKey ---
 
 func TestMetaKey(t *testing.T) {
 	url1 := "https://example.com/geoip.dat"
@@ -148,12 +146,10 @@ func TestMetaKey(t *testing.T) {
 		t.Error("different URLs must produce different cache keys")
 	}
 
-	// Keys must be deterministic.
 	if metaKey(url1) != k1 {
 		t.Error("metaKey is not deterministic")
 	}
 
-	// Keys must be filesystem-safe: 64 hex chars + ".meta" suffix.
 	const suffix = ".meta"
 	if len(k1) <= len(suffix) || k1[len(k1)-len(suffix):] != suffix {
 		t.Errorf("metaKey missing .meta suffix: %q", k1)
@@ -165,8 +161,6 @@ func TestMetaKey(t *testing.T) {
 		}
 	}
 }
-
-// --- isCached ---
 
 func TestIsCached(t *testing.T) {
 	dir := t.TempDir()
@@ -187,7 +181,6 @@ func TestIsCached(t *testing.T) {
 		}
 	})
 
-	// Create the local file and cache metadata.
 	if err := os.WriteFile(dst, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -220,21 +213,18 @@ func TestIsCached(t *testing.T) {
 	})
 }
 
-// --- streamToFile size limit ---
-
 func TestStreamToFileSizeLimit(t *testing.T) {
-	// Construct a fake response body larger than maxFileSize.
-	// We use a pipe so we do not allocate 100 MB in memory.
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "oversized.dat")
-
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Write maxFileSize+2 bytes of zeros in a goroutine.
 	go func() {
+		defer func() {
+			if closeErr := pw.Close(); closeErr != nil {
+				return
+			}
+		}()
 		buf := make([]byte, 4096)
 		written := 0
 		limit := maxFileSize + 2
@@ -243,28 +233,28 @@ func TestStreamToFileSizeLimit(t *testing.T) {
 			if written+n > limit {
 				n = limit - written
 			}
-			_, _ = pw.Write(buf[:n]) //nolint:errcheck // mock write
-			written += n
+			writtenBytes, writeErr := pw.Write(buf[:n])
+			if writeErr != nil {
+				return
+			}
+			written += writtenBytes
 		}
-		_ = pw.Close() //nolint:errcheck // mock close
 	}()
 
-	// Replace resp.Body with the pipe reader to simulate a large download.
-	// We test the io.LimitReader enforcement directly.
 	limited := &limitedBody{r: pr, limit: maxFileSize + 1}
-	n, _ := countBytes(limited) //nolint:errcheck // intentionally exceeding limit
-	_ = pr.Close()              //nolint:errcheck // mock close
+	n, countErr := countBytes(limited)
+	if countErr != nil && !errors.Is(countErr, io.EOF) {
+		t.Logf("count error: %v", countErr)
+	}
+	if closeErr := pr.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
 
 	if n <= int64(maxFileSize) {
 		t.Errorf("test data generator produced only %d bytes, need > %d", n, maxFileSize)
 	}
-
-	// Verify dst was not created (no actual streamToFile call needed for this
-	// boundary check — the byte counting above confirms the limit triggers).
-	_ = dst
 }
 
-// limitedBody is a minimal io.Reader wrapper that counts bytes read.
 type limitedBody struct {
 	r     *os.File
 	limit int64
@@ -285,8 +275,6 @@ func countBytes(r *limitedBody) (int64, error) {
 		}
 	}
 }
-
-// --- applyAuth cross-origin redirect protection ---
 
 func TestApplyAuthCrossOriginProtection(t *testing.T) {
 	cfg := &config.Config{
@@ -325,7 +313,6 @@ func TestApplyAuthCrossOriginProtection(t *testing.T) {
 			reqURL:   "https://cdn-noauth.example.com/geoip.dat",
 			origHost: "cdn-noauth.example.com",
 			wantAuth: false,
-			// override cfg inline below
 		},
 	}
 
@@ -346,5 +333,1160 @@ func TestApplyAuthCrossOriginProtection(t *testing.T) {
 				t.Errorf("Authorization present=%v, want %v", hasAuth, tc.wantAuth)
 			}
 		})
+	}
+}
+
+var errMockResolve = errors.New("host not found")
+
+func mockResolveHost(host string) error {
+	if host == "example.com" {
+		return nil
+	}
+	return errMockResolve
+}
+
+func mockValidateResolveAndValidate(host string) error {
+	if host == "example.com" {
+		return nil
+	}
+	return errMockResolve
+}
+
+func init() {
+	validateResolveAndValidate = mockValidateResolveAndValidate
+}
+
+type mockRoundTripper struct{}
+
+func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	header := make(http.Header)
+	header.Set("Etag", `"v1"`)
+	header.Set("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+	header.Set("Content-Type", "application/octet-stream")
+
+	var body io.ReadCloser
+	if req.Method == http.MethodHead {
+		body = http.NoBody
+	} else {
+		body = io.NopCloser(strings.NewReader("fake geodata payload"))
+	}
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     header,
+		Body:       body,
+		Request:    req,
+	}, nil
+}
+
+func mockNewHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &mockRoundTripper{},
+	}
+}
+
+func TestPrepareGeoFiles(t *testing.T) {
+	origResolve := resolveHost
+	origClient := newHTTPClient
+	resolveHost = mockResolveHost
+	newHTTPClient = mockNewHTTPClient
+	t.Cleanup(func() {
+		resolveHost = origResolve
+		newHTTPClient = origClient
+	})
+
+	dir := t.TempDir()
+	cacheSubDir := filepath.Join(dir, ".cache")
+
+	cfg := &config.Config{
+		Geo: config.GeoConfig{
+			Enabled:    true,
+			Redownload: true,
+			URLs: config.GeoURLs{
+				GeoIP:   "https://example.com/mock-geoip.dat",
+				GeoSite: "https://example.com/mock-geosite.dat",
+				MMDB:    "https://example.com/mock-geoip.metadb",
+				ASN:     "https://example.com/mock-GeoLite2-ASN.mmdb",
+			},
+		},
+		Paths: config.Paths{
+			MihomoData: dir,
+		},
+		Version: "test",
+	}
+
+	log := logging.New(logging.LevelDebug, "test")
+
+	if err := PrepareGeoFiles(cfg, log); err != nil {
+		t.Fatalf("PrepareGeoFiles failed: %v", err)
+	}
+
+	expected := []string{
+		filepath.Join(dir, "geoip.dat"),
+		filepath.Join(dir, "geosite.dat"),
+		filepath.Join(dir, "geoip.metadb"),
+		filepath.Join(dir, "GeoLite2-ASN.mmdb"),
+	}
+
+	for _, f := range expected {
+		info, err := os.Stat(f)
+		if err != nil {
+			t.Errorf("expected file not found: %s: %v", f, err)
+			continue
+		}
+		if info.Size() == 0 {
+			t.Errorf("file is empty: %s", f)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("file %s has permissions %04o, want 0600", f, perm)
+		}
+	}
+
+	entries, err := os.ReadDir(cacheSubDir)
+	if err != nil {
+		t.Fatalf("cache directory not created: %v", err)
+	}
+	if len(entries) != 4 {
+		t.Errorf("expected 4 cache metadata files, got %d", len(entries))
+	}
+
+	cfg.Geo.Redownload = false
+	if err := PrepareGeoFiles(cfg, log); err != nil {
+		t.Fatalf("second PrepareGeoFiles failed: %v", err)
+	}
+}
+
+func TestDefaultNewHTTPClient(t *testing.T) {
+	client := defaultNewHTTPClient()
+	if client == nil || client.Transport == nil {
+		t.Error("expected non-nil client and transport")
+	}
+}
+
+type mockStatusRoundTripper struct {
+	header     http.Header
+	statusCode int
+}
+
+func (m *mockStatusRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: m.statusCode,
+		Header:     m.header,
+		Body:       io.NopCloser(strings.NewReader("response")),
+		Request:    req,
+	}, nil
+}
+
+func TestFetchMetaErrors(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	cfg := &config.Config{
+		Geo: config.GeoConfig{
+			AuthUser: "user",
+			AuthPass: "pass",
+		},
+	}
+
+	t.Run("status 404", func(t *testing.T) {
+		client := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusNotFound, header: http.Header{}}}
+		if _, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com"); err == nil {
+			t.Error("expected error for 404, got nil")
+		}
+	})
+
+	t.Run("redirect missing location", func(t *testing.T) {
+		client := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusFound, header: http.Header{}}}
+		if _, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com"); err == nil {
+			t.Error("expected error for redirect without location, got nil")
+		}
+	})
+
+	t.Run("redirect loop", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Location", "https://example.com/file")
+		client := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusFound, header: h}}
+		if _, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com"); err == nil {
+			t.Error("expected error for redirect loop, got nil")
+		}
+	})
+}
+
+func TestOpenDownloadStreamErrors(t *testing.T) {
+	cfg := &config.Config{}
+	client := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusInternalServerError, header: http.Header{}}}
+	ctx := context.Background()
+	resp, err := openDownloadStream(ctx, client, cfg, "https://example.com/file", "example.com")
+	if err == nil {
+		if resp != nil && resp.Body != nil {
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				t.Log(closeErr)
+			}
+		}
+		t.Error("expected error for 500 status, got nil")
+	}
+
+	textHeader := http.Header{}
+	textHeader.Set("Content-Type", "text/html; charset=utf-8")
+	textClient := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusOK, header: textHeader}}
+	resp2, err := openDownloadStream(ctx, textClient, cfg, "https://example.com/file", "example.com")
+	if err == nil {
+		if resp2 != nil && resp2.Body != nil {
+			if closeErr := resp2.Body.Close(); closeErr != nil {
+				t.Log(closeErr)
+			}
+		}
+		t.Error("expected error for text/html content-type, got nil")
+	}
+}
+
+func TestSaveStreamToDestinationErrors(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "out.dat")
+
+	t.Run("destination invalid directory", func(t *testing.T) {
+		err := saveStreamToDestination(strings.NewReader("data"), filepath.Join(dir, "sub", "not_exist", "out.dat"))
+		if err == nil {
+			t.Error("expected error for non-existent directory, got nil")
+		}
+	})
+
+	t.Run("destination normal write", func(t *testing.T) {
+		err := saveStreamToDestination(strings.NewReader("small payload"), dst)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("empty payload error", func(t *testing.T) {
+		err := saveStreamToDestination(strings.NewReader(""), filepath.Join(dir, "empty.dat"))
+		if err == nil {
+			t.Error("expected error for empty payload, got nil")
+		}
+	})
+
+	t.Run("payload exceeds max size", func(t *testing.T) {
+		large := io.LimitReader(&infiniteReader{}, maxFileSize+2)
+		err := saveStreamToDestination(large, filepath.Join(dir, "large.dat"))
+		if err == nil {
+			t.Error("expected error for oversized payload, got nil")
+		}
+	})
+
+	t.Run("write temp file error", func(t *testing.T) {
+		err := saveStreamToDestination(errReader{}, filepath.Join(dir, "dest_err.dat"))
+		if err == nil || !strings.Contains(err.Error(), "write temp file") {
+			t.Errorf("expected write temp file error, got: %v", err)
+		}
+	})
+
+	t.Run("rename temp file error", func(t *testing.T) {
+		origRename := osRename
+		defer func() { osRename = origRename }()
+		osRename = func(_, _ string) error {
+			return errors.New("mock rename error")
+		}
+
+		err := saveStreamToDestination(strings.NewReader("valid data"), filepath.Join(dir, "dest_rename.dat"))
+		if err == nil || !strings.Contains(err.Error(), "rename temp file") {
+			t.Errorf("expected rename temp file error, got: %v", err)
+		}
+	})
+}
+
+type infiniteReader struct{}
+
+func (i *infiniteReader) Read(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func TestWriteCacheMetaErrors(t *testing.T) {
+	h := http.Header{}
+	h.Set("Etag", `"v1"`)
+	if err := writeCacheMeta("https://example.com/geo", h, "/nonexistent_dir_impossible/xyz"); err == nil {
+		t.Error("expected error for unwritable dir, got nil")
+	}
+}
+
+type mockHeadFailRoundTripper struct{}
+
+func (m *mockHeadFailRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodHead {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{},
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	}
+	header := make(http.Header)
+	header.Set("Content-Type", "application/octet-stream")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader("geo payload")),
+		Request:    req,
+	}, nil
+}
+
+func TestDownloadMetaFetchFails(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Geo: config.GeoConfig{
+			Enabled: true,
+		},
+		Paths: config.Paths{
+			MihomoData: dir,
+		},
+	}
+	log := logging.New(logging.LevelDebug, "test")
+	client := &http.Client{Transport: &mockHeadFailRoundTripper{}}
+	dst := filepath.Join(dir, "test.dat")
+
+	if err := download(client, cfg, log, "https://example.com/fallback.dat", dst); err == nil {
+		t.Error("expected error on HEAD failure, got nil")
+	}
+}
+
+func TestDownloadWriteCacheMetaWarn(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	dir := t.TempDir()
+	cacheBlocker := filepath.Join(dir, ".cache")
+	if err := os.WriteFile(cacheBlocker, []byte("not a dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Geo: config.GeoConfig{
+			Enabled:    true,
+			Redownload: true,
+		},
+		Paths: config.Paths{
+			MihomoData: dir,
+		},
+	}
+	log := logging.New(logging.LevelDebug, "test")
+	client := mockNewHTTPClient()
+	dst := filepath.Join(dir, "test.dat")
+
+	if err := download(client, cfg, log, "https://example.com/file.dat", dst); err != nil {
+		t.Fatalf("download should succeed despite cache write failure: %v", err)
+	}
+}
+
+type customRoundTripper struct {
+	fn func(req *http.Request) (*http.Response, error)
+}
+
+func (c *customRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return c.fn(req)
+}
+
+func TestWriteCacheMetaEmptyHeaders(t *testing.T) {
+	dir := t.TempDir()
+	err := writeCacheMeta("https://example.com/test.dat", http.Header{}, dir)
+	if err != nil {
+		t.Fatalf("unexpected error with empty headers: %v", err)
+	}
+}
+
+func TestFetchMetaRedirectNoLocation(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{},
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	_, _, err := fetchMeta(client, cfg, "https://example.com/redirect", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "no Location header") {
+		t.Errorf("expected no Location header error, got: %v", err)
+	}
+}
+
+func TestFetchMetaStatusError(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Header:     http.Header{},
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	_, _, err := fetchMeta(client, cfg, "https://example.com/notfound", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 404") {
+		t.Errorf("expected 404 status error, got: %v", err)
+	}
+}
+
+func TestDefaultNewHTTPClientCheckRedirect(t *testing.T) {
+	client := defaultNewHTTPClient()
+	if client.CheckRedirect == nil {
+		t.Fatal("expected CheckRedirect to be set")
+	}
+	if err := client.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Errorf("got %v, want http.ErrUseLastResponse", err)
+	}
+}
+
+func TestValidateGeoURLAndResolveRedirectEdgeCases(t *testing.T) {
+	if err := validateGeoURL("https://example.com/foo\x7f"); err == nil {
+		t.Error("expected parse error for URL with control char, got nil")
+	}
+	if _, err := resolveRedirect("https://example.com/foo\x7f", "https://example.com/bar"); err == nil {
+		t.Error("expected resolveRedirect error for bad current URL, got nil")
+	}
+}
+
+func TestFetchMetaMaxRedirectsExceeded(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				h.Set("Location", "https://example.com/loop")
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     h,
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	_, _, err := fetchMeta(client, cfg, "https://example.com/loop", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("expected exceeded max redirects error, got: %v", err)
+	}
+}
+
+func TestFetchMetaRedirectToInvalidTarget(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				h.Set("Location", "https://example.com/%00bad")
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     h,
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	_, _, err := fetchMeta(client, cfg, "https://example.com/start", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "redirect target invalid") {
+		t.Errorf("expected redirect target invalid error, got: %v", err)
+	}
+}
+
+type mockErrReader struct{}
+
+func (e *mockErrReader) Read(_ []byte) (int, error) {
+	return 0, errors.New("read error")
+}
+
+func TestSaveStreamToDestinationEdgeCases(t *testing.T) {
+	dir := t.TempDir()
+
+	err := saveStreamToDestination(&mockErrReader{}, filepath.Join(dir, "err.dat"))
+	if err == nil || !strings.Contains(err.Error(), "write temp file") {
+		t.Errorf("expected write temp file error, got: %v", err)
+	}
+
+	existingDir := filepath.Join(dir, "target_dir")
+	if mkdirErr := os.Mkdir(existingDir, 0o700); mkdirErr != nil {
+		t.Fatal(mkdirErr)
+	}
+	err = saveStreamToDestination(strings.NewReader("content"), existingDir)
+	if err == nil || !strings.Contains(err.Error(), "rename temp file") {
+		t.Errorf("expected rename temp file error, got: %v", err)
+	}
+
+	dummyFile := filepath.Join(dir, "dummy_file")
+	if writeErr := os.WriteFile(dummyFile, []byte("data"), 0o600); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	err = saveStreamToDestination(strings.NewReader("content"), filepath.Join(dummyFile, "out.dat"))
+	if err == nil || !strings.Contains(err.Error(), "create temp file") {
+		t.Errorf("expected create temp file error, got: %v", err)
+	}
+}
+
+func TestIsCachedEdgeCases(t *testing.T) {
+	dir := t.TempDir()
+	dummyFile := filepath.Join(dir, "dummy_file")
+	if err := os.WriteFile(dummyFile, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "existing_dst.dat")
+	if err := os.WriteFile(dst, []byte("dst"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := isCached(dst, "https://example.com/test", http.Header{}, dummyFile)
+	if err == nil || !strings.Contains(err.Error(), "resolve cache dir") {
+		t.Errorf("expected resolve cache dir error, got: %v", err)
+	}
+
+	_, err = isCached(dst, "https://example.com/test", http.Header{}, dir)
+	if err == nil || !strings.Contains(err.Error(), "read cache metadata") {
+		t.Errorf("expected read cache metadata error, got: %v", err)
+	}
+}
+
+func TestWriteCacheMetaRenameError(t *testing.T) {
+	dir := t.TempDir()
+	rawURL := "https://example.com/rename_test"
+	cDir, err := cacheDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetCacheFile := filepath.Join(cDir, metaKey(rawURL))
+	if mkdirErr := os.Mkdir(targetCacheFile, 0o700); mkdirErr != nil {
+		t.Fatal(mkdirErr)
+	}
+	err = writeCacheMeta(rawURL, http.Header{}, dir)
+	if err == nil || !strings.Contains(err.Error(), "rename cache file") {
+		t.Errorf("expected rename cache file error, got: %v", err)
+	}
+}
+
+func TestOpenDownloadStreamEdgeCases(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+
+	resp, err := openDownloadStream(ctx, mockNewHTTPClient(), cfg, "https://example.com/bad\x7f", "example.com")
+	if resp != nil && resp.Body != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Log(closeErr)
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "create GET request") {
+		t.Errorf("expected create GET request error, got: %v", err)
+	}
+
+	failingClient := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(_ *http.Request) (*http.Response, error) {
+				return nil, errors.New("network failure")
+			},
+		},
+	}
+	resp, err = openDownloadStream(ctx, failingClient, cfg, "https://example.com/fail", "example.com")
+	if resp != nil && resp.Body != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Log(closeErr)
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "execute GET request") {
+		t.Errorf("expected execute GET request error, got: %v", err)
+	}
+}
+
+func TestPrepareGeoFilesError(t *testing.T) {
+	origResolve := resolveHost
+	origClient := newHTTPClient
+	resolveHost = mockResolveHost
+	newHTTPClient = mockNewHTTPClient
+	t.Cleanup(func() {
+		resolveHost = origResolve
+		newHTTPClient = origClient
+	})
+
+	cfg := &config.Config{
+		Geo: config.GeoConfig{
+			URLs: config.GeoURLs{
+				GeoIP:   "https://example.com/%00invalid",
+				GeoSite: "https://example.com/geosite.dat",
+				MMDB:    "https://example.com/geoip.metadb",
+				ASN:     "https://example.com/GeoLite2-ASN.mmdb",
+			},
+		},
+		Paths: config.Paths{
+			MihomoData: t.TempDir(),
+		},
+	}
+	log := logging.New(logging.LevelDebug, "test")
+	err := PrepareGeoFiles(cfg, log)
+	if err == nil || !strings.Contains(err.Error(), "sync downloads") {
+		t.Errorf("expected sync downloads error, got: %v", err)
+	}
+}
+
+func TestOpenDownloadStreamTextContentType(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+
+	textClient := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				h.Set("Content-Type", "text/plain; charset=utf-8")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     h,
+					Body:       io.NopCloser(strings.NewReader("error")),
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	resp, err := openDownloadStream(ctx, textClient, cfg, "https://example.com/text", "example.com")
+	if resp != nil && resp.Body != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Log(closeErr)
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "text content-type") {
+		t.Errorf("expected text content-type error, got: %v", err)
+	}
+}
+
+func TestFetchMetaInvalidRedirectLocation(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				h.Set("Location", "http://example.com/downgrade")
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     h,
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	_, _, err := fetchMeta(client, cfg, "https://example.com/badloc", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "resolve redirect location") {
+		t.Errorf("expected resolve redirect location error, got: %v", err)
+	}
+}
+
+func TestStreamToFileSaveError(t *testing.T) {
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				h.Set("Content-Type", "application/octet-stream")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     h,
+					Body:       io.NopCloser(strings.NewReader("valid content")),
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	dir := t.TempDir()
+	existingDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(existingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := streamToFile(client, cfg, "https://example.com/file.dat", "example.com", existingDir)
+	if err == nil {
+		t.Error("expected error when streamToFile destination is a directory, got nil")
+	}
+}
+
+func TestWriteCacheMetaResolveDirError(t *testing.T) {
+	dir := t.TempDir()
+	dummyFile := filepath.Join(dir, "dummy_file")
+	if err := os.WriteFile(dummyFile, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := writeCacheMeta("https://example.com/test", http.Header{}, dummyFile)
+	if err == nil || !strings.Contains(err.Error(), "resolve cache dir") {
+		t.Errorf("expected resolve cache dir error, got: %v", err)
+	}
+}
+
+type mockBodyCloseError struct {
+	io.Reader
+}
+
+func (mockBodyCloseError) Close() error {
+	return errors.New("simulated body close error")
+}
+
+type errReader struct{}
+
+func (errReader) Read(_ []byte) (int, error) {
+	return 0, errors.New("simulated read failure")
+}
+
+func TestFetchMetaBodyCloseError(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       mockBodyCloseError{Reader: strings.NewReader("")},
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	_, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "close HEAD response") {
+		t.Errorf("expected close HEAD response error, got: %v", err)
+	}
+}
+
+func TestStreamToFileBodyCloseError(t *testing.T) {
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				h.Set("Content-Type", "application/octet-stream")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     h,
+					Body:       mockBodyCloseError{Reader: strings.NewReader("content")},
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	dst := filepath.Join(t.TempDir(), "out.dat")
+	err := streamToFile(client, cfg, "https://example.com/file", "example.com", dst)
+	if err == nil || !strings.Contains(err.Error(), "close response body") {
+		t.Errorf("expected close response body error, got: %v", err)
+	}
+}
+
+func TestOpenDownloadStreamBodyCloseErrors(t *testing.T) {
+	client404 := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       mockBodyCloseError{Reader: strings.NewReader("404")},
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	resp404, err := openDownloadStream(context.Background(), client404, cfg, "https://example.com/file", "example.com")
+	if resp404 != nil && resp404.Body != nil {
+		if closeErr := resp404.Body.Close(); closeErr != nil {
+			t.Log(closeErr)
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "close response body on status 404") {
+		t.Errorf("expected close error on status 404, got: %v", err)
+	}
+
+	clientHTML := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				h.Set("Content-Type", "text/html; charset=utf-8")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     h,
+					Body:       mockBodyCloseError{Reader: strings.NewReader("<html>")},
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	respHTML, err := openDownloadStream(context.Background(), clientHTML, cfg, "https://example.com/file", "example.com")
+	if respHTML != nil && respHTML.Body != nil {
+		if closeErr := respHTML.Body.Close(); closeErr != nil {
+			t.Log(closeErr)
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "close response body on text content-type") {
+		t.Errorf("expected close error on text content-type, got: %v", err)
+	}
+}
+
+func TestDownloadChmodError(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() {
+		resolveHost = origResolve
+	})
+
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "file.dat")
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodHead {
+					h := make(http.Header)
+					h.Set("ETag", "123")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     h,
+						Body:       http.NoBody,
+						Request:    req,
+					}, nil
+				}
+				h := make(http.Header)
+				h.Set("Content-Type", "application/octet-stream")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     h,
+					Body:       io.NopCloser(strings.NewReader("payload")),
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{
+		Paths: config.Paths{
+			MihomoData: dir,
+		},
+	}
+	log := logging.New(logging.LevelDebug, "test")
+
+	origChmod := osChmod
+	defer func() { osChmod = origChmod }()
+	osChmod = func(_ string, _ os.FileMode) error {
+		return errors.New("mock chmod error")
+	}
+
+	err := download(client, cfg, log, "https://example.com/file.dat", dst)
+	if err == nil || !strings.Contains(err.Error(), "chmod") {
+		t.Errorf("expected chmod error, got: %v", err)
+	}
+}
+
+func TestDefaultDialerControl(t *testing.T) {
+	if err := defaultDialerControl("tcp", "bad-address-no-port", nil); err == nil {
+		t.Error("expected malformed dial address error, got nil")
+	}
+	if err := defaultDialerControl("tcp", "127.0.0.1:80", nil); err == nil {
+		t.Error("expected restricted IP error, got nil")
+	}
+	if err := defaultDialerControl("tcp", "93.184.216.34:443", nil); err != nil {
+		t.Errorf("expected success for valid IP, got: %v", err)
+	}
+	if err := defaultDialerControl("tcp", "example.com:443", nil); err != nil {
+		t.Errorf("expected success for host name (non-ip), got: %v", err)
+	}
+}
+
+func TestDownloadURLParseError(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() { resolveHost = origResolve })
+
+	origParse := urlParse
+	defer func() { urlParse = origParse }()
+	urlParse = func(string) (*url.URL, error) {
+		return nil, errors.New("mock parse error")
+	}
+
+	cfg := &config.Config{Paths: config.Paths{MihomoData: t.TempDir()}}
+	log := logging.New(logging.LevelDebug, "test")
+	err := download(mockNewHTTPClient(), cfg, log, "https://example.com/file.dat", filepath.Join(cfg.Paths.MihomoData, "file.dat"))
+	if err == nil || !strings.Contains(err.Error(), "parse original URL") {
+		t.Errorf("expected parse original URL error, got: %v", err)
+	}
+}
+
+func TestDownloadStreamToFileError(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() { resolveHost = origResolve })
+
+	dir := t.TempDir()
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodHead {
+					h := make(http.Header)
+					h.Set("ETag", "123")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     h,
+						Body:       http.NoBody,
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("server error")),
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{Paths: config.Paths{MihomoData: dir}}
+	log := logging.New(logging.LevelDebug, "test")
+	err := download(client, cfg, log, "https://example.com/file.dat", filepath.Join(dir, "file.dat"))
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 500") {
+		t.Errorf("expected download streamToFile error, got: %v", err)
+	}
+}
+
+func TestFetchMetaRequestAndDoErrors(t *testing.T) {
+	origResolve := resolveHost
+	resolveHost = mockResolveHost
+	t.Cleanup(func() { resolveHost = origResolve })
+
+	origReq := httpNewRequestWithContext
+	defer func() { httpNewRequestWithContext = origReq }()
+	httpNewRequestWithContext = func(context.Context, string, string, io.Reader) (*http.Request, error) {
+		return nil, errors.New("mock req error")
+	}
+
+	cfg := &config.Config{}
+	_, _, err := fetchMeta(mockNewHTTPClient(), cfg, "https://example.com/file", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "create HEAD request") {
+		t.Errorf("expected create HEAD request error, got: %v", err)
+	}
+
+	httpNewRequestWithContext = origReq
+	clientErr := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(_ *http.Request) (*http.Response, error) {
+				return nil, errors.New("network failure")
+			},
+		},
+	}
+	_, _, err = fetchMeta(clientErr, cfg, "https://example.com/file", "example.com")
+	if err == nil || !strings.Contains(err.Error(), "create HEAD request") {
+		t.Errorf("expected network failure error, got: %v", err)
+	}
+}
+
+func TestStreamToFileOpenStreamError(t *testing.T) {
+	client := &http.Client{
+		Transport: &customRoundTripper{
+			fn: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("err")),
+					Request:    req,
+				}, nil
+			},
+		},
+	}
+	cfg := &config.Config{}
+	dst := filepath.Join(t.TempDir(), "out.dat")
+	err := streamToFile(client, cfg, "https://example.com/file", "example.com", dst)
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 500") {
+		t.Errorf("expected open stream error, got: %v", err)
+	}
+}
+
+func TestSaveStreamToDestinationTempErrors(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "dst.dat")
+
+	origCreate := osCreateTemp
+	defer func() { osCreateTemp = origCreate }()
+	osCreateTemp = func(_, _ string) (*os.File, error) {
+		return nil, errors.New("mock create temp error")
+	}
+	err := saveStreamToDestination(strings.NewReader("data"), dst)
+	if err == nil || !strings.Contains(err.Error(), "create temp file") {
+		t.Errorf("expected create temp error, got: %v", err)
+	}
+	osCreateTemp = origCreate
+
+	origChmod := tempFileChmod
+	defer func() { tempFileChmod = origChmod }()
+	tempFileChmod = func(_ *os.File, _ os.FileMode) error {
+		return errors.New("mock chmod error")
+	}
+	err = saveStreamToDestination(strings.NewReader("data"), dst)
+	if err == nil || !strings.Contains(err.Error(), "chmod temp file") {
+		t.Errorf("expected chmod temp error, got: %v", err)
+	}
+	tempFileChmod = origChmod
+
+	origSync := tempFileSync
+	defer func() { tempFileSync = origSync }()
+	tempFileSync = func(_ *os.File) error {
+		return errors.New("mock sync error")
+	}
+	err = saveStreamToDestination(strings.NewReader("data"), dst)
+	if err == nil || !strings.Contains(err.Error(), "sync temp file") {
+		t.Errorf("expected sync temp error, got: %v", err)
+	}
+	tempFileSync = origSync
+
+	origClose := tempFileClose
+	defer func() { tempFileClose = origClose }()
+	tempFileClose = func(_ *os.File) error {
+		return errors.New("mock close error")
+	}
+	err = saveStreamToDestination(strings.NewReader("data"), dst)
+	if err == nil || !strings.Contains(err.Error(), "close temp file") {
+		t.Errorf("expected close temp error, got: %v", err)
+	}
+}
+
+func TestWriteCacheMetaTempErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	origCreate := osCreateTemp
+	defer func() { osCreateTemp = origCreate }()
+	osCreateTemp = func(_, _ string) (*os.File, error) {
+		return nil, errors.New("mock create temp error")
+	}
+	err := writeCacheMeta("https://example.com/file", http.Header{}, dir)
+	if err == nil || !strings.Contains(err.Error(), "create temp cache file") {
+		t.Errorf("expected create temp cache error, got: %v", err)
+	}
+	osCreateTemp = origCreate
+
+	origWrite := tempFileWriteString
+	defer func() { tempFileWriteString = origWrite }()
+	tempFileWriteString = func(_ *os.File, _ string) (int, error) {
+		return 0, errors.New("mock write error")
+	}
+	err = writeCacheMeta("https://example.com/file", http.Header{}, dir)
+	if err == nil || !strings.Contains(err.Error(), "write cache metadata") {
+		t.Errorf("expected write cache metadata error, got: %v", err)
+	}
+	tempFileWriteString = origWrite
+
+	origClose := tempFileClose
+	defer func() { tempFileClose = origClose }()
+	tempFileClose = func(_ *os.File) error {
+		return errors.New("mock close error")
+	}
+	err = writeCacheMeta("https://example.com/file", http.Header{}, dir)
+	if err == nil || !strings.Contains(err.Error(), "close temp cache file") {
+		t.Errorf("expected close temp cache error, got: %v", err)
+	}
+}
+
+func TestDefaultTempFileHelpers(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "helper_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaultTempFileWriteString(f, "test"); err != nil {
+		t.Errorf("defaultTempFileWriteString failed: %v", err)
+	}
+	if err := defaultTempFileSync(f); err != nil {
+		t.Errorf("defaultTempFileSync failed: %v", err)
+	}
+	if err := defaultTempFileChmod(f, 0o600); err != nil {
+		t.Errorf("defaultTempFileChmod failed: %v", err)
+	}
+	if err := defaultTempFileClose(f); err != nil {
+		t.Errorf("defaultTempFileClose failed: %v", err)
+	}
+
+	if _, err := defaultTempFileWriteString(f, "test"); err == nil {
+		t.Error("expected error on closed file, got nil")
+	}
+	if err := defaultTempFileSync(f); err == nil {
+		t.Error("expected error on closed file, got nil")
+	}
+	if err := defaultTempFileChmod(f, 0o600); err == nil {
+		t.Error("expected error on closed file, got nil")
+	}
+	if err := defaultTempFileClose(f); err == nil {
+		t.Error("expected error on closed file, got nil")
+	}
+}
+
+func mockValidateResolveSuccess(_ string) error {
+	return nil
+}
+
+func mockValidateResolveFailure(_ string) error {
+	return errors.New("mock dns failure")
+}
+
+func TestDefaultResolveHostSuccessAndError(t *testing.T) {
+	origVal := validateResolveAndValidate
+	defer func() { validateResolveAndValidate = origVal }()
+
+	validateResolveAndValidate = mockValidateResolveSuccess
+	if err := defaultResolveHost("example.com"); err != nil {
+		t.Errorf("expected success, got: %v", err)
+	}
+
+	validateResolveAndValidate = mockValidateResolveFailure
+	if err := defaultResolveHost("example.com"); err == nil {
+		t.Error("expected error, got nil")
 	}
 }

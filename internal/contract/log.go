@@ -1,12 +1,9 @@
 package contract
 
+// Log level names accepted by the container entrypoint and proxy configuration.
 const (
-	// LogLevelDebug enables verbose diagnostic logging.
 	LogLevelDebug = "DEBUG"
-	// LogLevelInfo enables informational logging.
-	LogLevelInfo = "INFO"
-	// LogLevelWarn enables warning-only logging.
-	LogLevelWarn = "WARN"
-	// LogLevelError enables error-only logging.
+	LogLevelInfo  = "INFO"
+	LogLevelWarn  = "WARN"
 	LogLevelError = "ERROR"
 )

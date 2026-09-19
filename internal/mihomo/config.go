@@ -42,7 +42,7 @@ import (
 	"github.com/underhax/mihomo-warp-proxy/internal/wgcf"
 )
 
-const maxConfigSize = 1024 * 1024 // 1 MB limit to prevent YAML bomb DoS
+const maxConfigSize = 1024 * 1024
 
 const (
 	yamlTagBool = "!!bool"
@@ -76,9 +76,6 @@ func EnsureConfig(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte, l
 	return nil
 }
 
-// createTemplate writes a minimal but fully functional config.yaml.
-// Called only on first run when no prior config exists.
-// Uses map[string]any — key order is not critical for a fresh file.
 func createTemplate(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte) error {
 	doc := make(map[string]any)
 	applyOwnedFieldsMap(doc, cfg)
@@ -97,17 +94,18 @@ func createTemplate(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte)
 	return writeConfigMap(cfg.Paths.MihomoConfigFile, doc)
 }
 
-// patchConfig reads the existing config.yaml as a yaml.Node tree (preserving
-// key order and comments), updates only owned fields in place, and writes the
-// result back atomically.
-func patchConfig(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte, log *logging.Logger) error {
+func patchConfig(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte, log *logging.Logger) (retErr error) {
 	f, err := os.Open(cfg.Paths.MihomoConfigFile)
 	if err != nil {
 		return fmt.Errorf("open config: %w", err)
 	}
-	defer func() { _ = f.Close() }() //nolint:errcheck // read-only file
+	defer func() {
+		if closeErr := fileClose(f); closeErr != nil && retErr == nil {
+			retErr = fmt.Errorf("close config: %w", closeErr)
+		}
+	}()
 
-	raw, err := io.ReadAll(io.LimitReader(f, maxConfigSize+1))
+	raw, err := fileReadAll(io.LimitReader(f, maxConfigSize+1))
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
 	}
@@ -115,13 +113,11 @@ func patchConfig(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte, lo
 		return fmt.Errorf("config file exceeds max allowed size of %d bytes", maxConfigSize)
 	}
 
-	// Unmarshal into yaml.Node to preserve key order, comments and style.
 	var root yaml.Node
 	if err := yaml.Unmarshal(raw, &root); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
-	// yaml.Unmarshal wraps the document in a DocumentNode.
 	doc := docMapping(&root)
 	if doc == nil {
 		return errors.New("config is not a YAML mapping")
@@ -138,14 +134,10 @@ func patchConfig(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte, lo
 	if cfg.Warp.Enabled && profile != nil {
 		patchWarpProxy(doc, cfg, profile, reserved, log)
 	}
-	// When USE_WARP_CONFIG=false proxies and rules are left completely untouched.
 
 	return writeConfigNode(cfg.Paths.MihomoConfigFile, &root)
 }
 
-// ── owned fields (yaml.Node path) ────────────────────────────────────────────
-
-// applyOwnedFieldsNode updates the top-level managed scalar fields in place.
 func applyOwnedFieldsNode(doc *yaml.Node, cfg *config.Config) {
 	setNodeScalar(doc, "mixed-port", yamlTagInt, strconv.FormatUint(uint64(cfg.ProxyPort), 10))
 	setNodeScalar(doc, "log-level", yamlTagStr, cfg.ProxyLogLevel)
@@ -162,7 +154,6 @@ func applyOwnedFieldsNode(doc *yaml.Node, cfg *config.Config) {
 	setNodeValue(doc, "authentication", authSeq)
 }
 
-// applyGeoFieldsNode writes or updates the geodata block.
 func applyGeoFieldsNode(doc *yaml.Node, cfg *config.Config) {
 	setNodeScalar(doc, "geodata-mode", yamlTagBool, "true")
 	setNodeScalar(doc, "geodata-loader", yamlTagStr, "memconservative")
@@ -184,7 +175,6 @@ func applyGeoFieldsNode(doc *yaml.Node, cfg *config.Config) {
 	setNodeValue(doc, "geox-url", geoMap)
 }
 
-// removeGeoFieldsNode deletes geodata keys from the mapping node.
 func removeGeoFieldsNode(doc *yaml.Node) {
 	for _, k := range []string{
 		"geodata-mode", "geodata-loader", "geo-auto-update",
@@ -194,16 +184,11 @@ func removeGeoFieldsNode(doc *yaml.Node) {
 	}
 }
 
-// ── warp proxy (yaml.Node path) ───────────────────────────────────────────────
-
-// patchWarpProxy finds or appends the warp proxy in the document's proxies
-// sequence. All other proxies and all rules are left untouched.
 func patchWarpProxy(doc *yaml.Node, cfg *config.Config, profile *wgcf.Profile, reserved [3]byte, log *logging.Logger) {
 	warpNode := buildWarpProxy(cfg, profile, reserved)
 
 	proxiesNode := getMappingValue(doc, "proxies")
 	if proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
-		// No proxies section — create one.
 		proxiesNode = &yaml.Node{Kind: yaml.SequenceNode, Tag: yamlTagSeq}
 		setNodeValue(doc, "proxies", proxiesNode)
 	}
@@ -212,8 +197,6 @@ func patchWarpProxy(doc *yaml.Node, cfg *config.Config, profile *wgcf.Profile, r
 	if idx < 0 {
 		log.Debug("mihomo: warp proxy not found — appending to proxies list")
 
-		// Special case: proxies is empty and the sole rule is MATCH,DIRECT —
-		// this is exactly the minimal template from USE_WARP_CONFIG=false.
 		if len(proxiesNode.Content) == 0 && isMinimalTemplateNode(doc) {
 			rulesNode := getMappingValue(doc, "rules")
 			if rulesNode != nil && len(rulesNode.Content) == 1 {
@@ -226,7 +209,6 @@ func patchWarpProxy(doc *yaml.Node, cfg *config.Config, profile *wgcf.Profile, r
 		return
 	}
 
-	// Replace the existing warp entry in-place — consistent key order.
 	proxiesNode.Content[idx] = warpNode
 }
 
@@ -238,9 +220,6 @@ func minimalTemplateWarpRule() string {
 	return "MATCH,warp"
 }
 
-// isMinimalTemplateNode returns true when the document has no proxies and
-// exactly one rule "MATCH,DIRECT" — the exact shape produced by createTemplate
-// with USE_WARP_CONFIG=false.
 func isMinimalTemplateNode(doc *yaml.Node) bool {
 	proxiesNode := getMappingValue(doc, "proxies")
 	if proxiesNode != nil && len(proxiesNode.Content) != 0 {
@@ -253,14 +232,6 @@ func isMinimalTemplateNode(doc *yaml.Node) bool {
 	return rulesNode.Content[0].Value == minimalTemplateDirectRule()
 }
 
-// ── warp proxy builder ────────────────────────────────────────────────────────
-
-// buildWarpProxy constructs the warp proxy as a *yaml.Node with an explicit
-// key order so the serialised config is easy to read:
-//
-//	name → type → server → port → ip → ipv6 → public-key → private-key →
-//	reserved → udp → mtu → remote-dns-resolve → dns →
-//	refresh-server-ip-interval → amnezia-wg-option
 func buildWarpProxy(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte) *yaml.Node {
 	server, port := splitEndpoint(cfg.Warp.Endpoint)
 	n := &yaml.Node{Kind: yaml.MappingNode, Tag: yamlTagMap}
@@ -311,8 +282,6 @@ func buildWarpProxy(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte)
 	return n
 }
 
-// buildAmneziaNode constructs the amnezia-wg-option as a *yaml.Node with
-// explicit key order: jc → jmin → jmax → s1 → s2 → h1…h4 → i1…i5.
 func buildAmneziaNode(cfg *config.Config) *yaml.Node {
 	a := cfg.Warp.Amnezia
 	n := &yaml.Node{Kind: yaml.MappingNode, Tag: yamlTagMap}
@@ -341,9 +310,6 @@ func buildAmneziaNode(cfg *config.Config) *yaml.Node {
 	return n
 }
 
-// ── yaml.Node helpers ─────────────────────────────────────────────────────────
-
-// docMapping unwraps a DocumentNode and returns the root MappingNode.
 func docMapping(root *yaml.Node) *yaml.Node {
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		if root.Content[0].Kind == yaml.MappingNode {
@@ -356,7 +322,6 @@ func docMapping(root *yaml.Node) *yaml.Node {
 	return nil
 }
 
-// getMappingValue returns the value node for the given key, or nil.
 func getMappingValue(doc *yaml.Node, key string) *yaml.Node {
 	for i := 0; i+1 < len(doc.Content); i += 2 {
 		if doc.Content[i].Value != key {
@@ -367,8 +332,6 @@ func getMappingValue(doc *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
-// setNodeScalar sets key=value (scalar) in the mapping, updating in place or
-// appending if the key does not exist.
 func setNodeScalar(doc *yaml.Node, key, tag, value string) {
 	for i := 0; i+1 < len(doc.Content); i += 2 {
 		if doc.Content[i].Value != key {
@@ -386,7 +349,6 @@ func setNodeScalar(doc *yaml.Node, key, tag, value string) {
 	)
 }
 
-// setNodeValue sets key=node in the mapping, updating in place or appending.
 func setNodeValue(doc *yaml.Node, key string, val *yaml.Node) {
 	for i := 0; i+1 < len(doc.Content); i += 2 {
 		if doc.Content[i].Value != key {
@@ -401,7 +363,6 @@ func setNodeValue(doc *yaml.Node, key string, val *yaml.Node) {
 	)
 }
 
-// deleteNodeKey removes a key-value pair from the mapping.
 func deleteNodeKey(doc *yaml.Node, key string) {
 	for i := 0; i+1 < len(doc.Content); i += 2 {
 		if doc.Content[i].Value != key {
@@ -412,8 +373,6 @@ func deleteNodeKey(doc *yaml.Node, key string) {
 	}
 }
 
-// findProxyByNameNode returns the index of the first element in a sequence
-// node whose "name" field equals name, or -1 if not found.
 func findProxyByNameNode(seq *yaml.Node, name string) int {
 	for i, item := range seq.Content {
 		if item.Kind == yaml.MappingNode && yamlNodeName(item) == name {
@@ -423,7 +382,6 @@ func findProxyByNameNode(seq *yaml.Node, name string) int {
 	return -1
 }
 
-// yamlNodeName extracts the value of the "name" key from a YAML mapping node.
 func yamlNodeName(n *yaml.Node) string {
 	if n == nil || n.Kind != yaml.MappingNode {
 		return ""
@@ -435,8 +393,6 @@ func yamlNodeName(n *yaml.Node) string {
 	}
 	return ""
 }
-
-// ── scalar node constructors ─────────────────────────────────────────────────
 
 func strNode(v string) *yaml.Node {
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: yamlTagStr, Value: v}
@@ -456,8 +412,6 @@ func boolStr(v bool) string {
 	}
 	return "false"
 }
-
-// ── map[string]any helpers (createTemplate only) ─────────────────────────────
 
 func applyOwnedFieldsMap(doc map[string]any, cfg *config.Config) {
 	doc["mixed-port"] = int(cfg.ProxyPort)
@@ -486,10 +440,6 @@ func applyGeoFieldsMap(doc map[string]any, cfg *config.Config) {
 	}
 }
 
-// ── endpoint helper ───────────────────────────────────────────────────────────
-
-// splitEndpoint splits "host:port" into host string and port int.
-// Uses net.SplitHostPort for robustness; endpoint is pre-validated by validateWarpEndpoint.
 func splitEndpoint(endpoint string) (host string, port int) {
 	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -502,11 +452,8 @@ func splitEndpoint(endpoint string) (host string, port int) {
 	return host, port
 }
 
-// ── write helpers ─────────────────────────────────────────────────────────────
-
-// writeConfigNode marshals a yaml.Node tree and atomically writes it to path.
 func writeConfigNode(path string, root *yaml.Node) error {
-	data, err := yaml.Marshal(root)
+	data, err := yamlMarshal(root)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -516,10 +463,8 @@ func writeConfigNode(path string, root *yaml.Node) error {
 	return nil
 }
 
-// writeConfigMap marshals a map[string]any and atomically writes it to path.
-// Used only by createTemplate where order is not critical.
 func writeConfigMap(path string, doc map[string]any) error {
-	data, err := yaml.Marshal(doc)
+	data, err := yamlMarshal(doc)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -528,3 +473,32 @@ func writeConfigMap(path string, doc map[string]any) error {
 	}
 	return nil
 }
+
+func defaultFileClose(f *os.File) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close file: %w", err)
+	}
+	return nil
+}
+
+func defaultFileReadAll(r io.Reader) ([]byte, error) {
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+	return buf, nil
+}
+
+func defaultYAMLMarshal(in any) ([]byte, error) {
+	b, err := yaml.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("yaml marshal: %w", err)
+	}
+	return b, nil
+}
+
+var (
+	fileClose   = defaultFileClose
+	fileReadAll = defaultFileReadAll
+	yamlMarshal = defaultYAMLMarshal
+)

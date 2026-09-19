@@ -1,8 +1,6 @@
 name: Build and Publish Docker Image
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
   workflow_dispatch:
 
 env:
@@ -13,45 +11,32 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    name: Check for upstream updates
+  prepare:
+    name: Prepare Metadata
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      needs_build: ${{ steps.check.outputs.needs_build }}
-      mihomo_ver:  ${{ steps.check.outputs.mihomo_ver }}
-      wgcf_ver:    ${{ steps.check.outputs.wgcf_ver }}
-      alpine_dig:  ${{ steps.check.outputs.alpine_dig }}
-      go_dig:      ${{ steps.check.outputs.go_dig }}
-      image_base:  ${{ steps.check.outputs.image_base }}
-    permissions:
-      contents: read
-      packages: read
-
+      mihomo_ver:  ${{ steps.extract.outputs.mihomo_ver }}
+      wgcf_ver:    ${{ steps.extract.outputs.wgcf_ver }}
+      alpine_dig:  ${{ steps.extract.outputs.alpine_dig }}
+      go_dig:      ${{ steps.extract.outputs.go_dig }}
+      image_base:  ${{ steps.extract.outputs.image_base }}
     steps:
-      - name: Resolve upstream versions and image digests
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract versions from Dockerfile
+        id: extract
         run: |
-          MIHOMO_VER=$(curl -sfL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
-            | jq -r '.tag_name // empty' | sed 's/^v//')
-          [ -n "${MIHOMO_VER}" ] || { echo "ERROR: failed to resolve mihomo version" >&2; exit 1; }
-
-          WGCF_VER=$(curl -sfL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/ViRb3/wgcf/releases/latest \
-            | jq -r '.tag_name // empty' | sed 's/^v//')
-          [ -n "${WGCF_VER}" ] || { echo "ERROR: failed to resolve wgcf version" >&2; exit 1; }
-
-          ALPINE_DIG=$(skopeo inspect docker://alpine:3.23 | jq -r '.Digest // empty')
-          [ -n "${ALPINE_DIG}" ] || { echo "ERROR: failed to resolve alpine digest" >&2; exit 1; }
-          GO_DIG=$(skopeo inspect docker://golang:1.26-alpine3.23 | jq -r '.Digest // empty')
-          [ -n "${GO_DIG}" ] || { echo "ERROR: failed to resolve go digest" >&2; exit 1; }
-
+          MIHOMO_VER=$(awk -F'[:@]' '/FROM metacubex\/mihomo/ {gsub(/^v/, "", $2); print $2}' Dockerfile)
+          WGCF_VER=$(awk -F'[:@]' '/FROM virb3\/wgcf/ {gsub(/^v/, "", $2); print $2}' Dockerfile)
+          ALPINE_DIG=$(awk -F'[@ ]' '/FROM alpine:/ {print $3}' Dockerfile)
+          GO_DIG=$(awk -F'[@ ]' '/golang:/ {for(i=1;i<=NF;i++) if($i ~ /^sha256:/) print $i}' Dockerfile)
           IMAGE_BASE=$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
+
+          [ -n "${MIHOMO_VER}" ] || { echo "ERROR: failed to parse Mihomo version"; exit 1; }
+          [ -n "${WGCF_VER}" ]   || { echo "ERROR: failed to parse Wgcf version"; exit 1; }
+          [ -n "${ALPINE_DIG}" ] || { echo "ERROR: failed to parse Alpine digest"; exit 1; }
+          [ -n "${GO_DIG}" ]     || { echo "ERROR: failed to parse Go digest"; exit 1; }
 
           echo "mihomo_ver=${MIHOMO_VER}" >> "$GITHUB_OUTPUT"
           echo "wgcf_ver=${WGCF_VER}"     >> "$GITHUB_OUTPUT"
@@ -59,36 +44,9 @@ jobs:
           echo "go_dig=${GO_DIG}"         >> "$GITHUB_OUTPUT"
           echo "image_base=${IMAGE_BASE}" >> "$GITHUB_OUTPUT"
 
-          if skopeo inspect "docker://${IMAGE_BASE}:latest" > meta.json 2>/dev/null; then
-            OUR_MIHOMO=$(jq -r '.Labels["org.opencontainers.image.version"] // "none"' meta.json)
-            OUR_WGCF=$(jq -r   '.Labels["dev.wgcf.version"]                // "none"' meta.json)
-            OUR_ALPINE=$(jq -r  '.Labels["dev.alpine.digest"]              // "none"' meta.json)
-            OUR_GO=$(jq -r      '.Labels["dev.golang.digest"]              // "none"' meta.json)
-          else
-            OUR_MIHOMO="none"; OUR_WGCF="none"; OUR_ALPINE="none"; OUR_GO="none"
-          fi
-
-          echo "--- Upstream vs published ---"
-          echo "  mihomo : ${MIHOMO_VER} (was: ${OUR_MIHOMO})"
-          echo "  wgcf   : ${WGCF_VER}  (was: ${OUR_WGCF})"
-          echo "  alpine : ${ALPINE_DIG} (was: ${OUR_ALPINE})"
-          echo "  go     : ${GO_DIG} (was: ${OUR_GO})"
-
-          if [ "${MIHOMO_VER}" != "${OUR_MIHOMO}"  ] || \
-             [ "${WGCF_VER}"   != "${OUR_WGCF}"    ] || \
-             [ "${ALPINE_DIG}" != "${OUR_ALPINE}"  ] || \
-             [ "${GO_DIG}"     != "${OUR_GO}"       ] || \
-             [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "needs_build=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "needs_build=false" >> "$GITHUB_OUTPUT"
-            echo "All components up to date, skipping build."
-          fi
-
   build:
     name: Build (${{ matrix.platform }}, ${{ matrix.cpu_variant || 'default' }})
-    needs: check
-    if: needs.check.outputs.needs_build == 'true'
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -118,9 +76,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -129,30 +87,29 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push platform image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: true
           platforms: ${{ matrix.platform }}
           tags: |
-            ${{ needs.check.outputs.image_base }}:${{ needs.check.outputs.mihomo_ver }}${{ matrix.push_tag_suffix }}
+            ${{ needs.prepare.outputs.image_base }}:${{ needs.prepare.outputs.mihomo_ver }}${{ matrix.push_tag_suffix }}
           provenance: false
           build-args: |
-            MIHOMO_VERSION=${{ needs.check.outputs.mihomo_ver }}
-            WGCF_VERSION=${{ needs.check.outputs.wgcf_ver }}
+            MIHOMO_VERSION=${{ needs.prepare.outputs.mihomo_ver }}
+            WGCF_VERSION=${{ needs.prepare.outputs.wgcf_ver }}
             MIHOMO_CPU_VARIANT=${{ matrix.cpu_variant }}
           labels: |
-            org.opencontainers.image.version=${{ needs.check.outputs.mihomo_ver }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.mihomo_ver }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Cloudflare WARP SOCKS5/HTTP(S) proxy via mihomo (Clash Meta)
-            dev.wgcf.version=${{ needs.check.outputs.wgcf_ver }}
-            dev.alpine.digest=${{ needs.check.outputs.alpine_dig }}
-            dev.golang.digest=${{ needs.check.outputs.go_dig }}
+            dev.wgcf.version=${{ needs.prepare.outputs.wgcf_ver }}
+            dev.alpine.digest=${{ needs.prepare.outputs.alpine_dig }}
+            dev.golang.digest=${{ needs.prepare.outputs.go_dig }}
 
   merge:
     name: Merge fat manifests
-    needs: [check, build]
-    if: needs.check.outputs.needs_build == 'true'
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -168,8 +125,8 @@ jobs:
 
       - name: Create default fat manifest (amd64v1 + arm64)
         run: |
-          BASE=${{ needs.check.outputs.image_base }}
-          VER=${{ needs.check.outputs.mihomo_ver }}
+          BASE=${{ needs.prepare.outputs.image_base }}
+          VER=${{ needs.prepare.outputs.mihomo_ver }}
 
           docker buildx imagetools create \
             --tag "${BASE}:${VER}" \
@@ -179,8 +136,8 @@ jobs:
 
       - name: Create versioned tags for v2 and v3
         run: |
-          BASE=${{ needs.check.outputs.image_base }}
-          VER=${{ needs.check.outputs.mihomo_ver }}
+          BASE=${{ needs.prepare.outputs.image_base }}
+          VER=${{ needs.prepare.outputs.mihomo_ver }}
 
           docker buildx imagetools create \
             --tag "${BASE}:${VER}-amd64v2" \

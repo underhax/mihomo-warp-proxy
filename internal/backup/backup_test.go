@@ -2,8 +2,11 @@ package backup
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/fsutil"
@@ -29,7 +32,6 @@ func TestConfigFileEmpty(t *testing.T) {
 		t.Errorf("empty source file should not error, got: %v", err)
 	}
 
-	// No backup should have been created for an empty file.
 	if _, err := os.Stat(src + ".back"); !os.IsNotExist(err) {
 		t.Error("backup file should not exist for empty source")
 	}
@@ -49,7 +51,7 @@ func TestConfigFileCreatesBackup(t *testing.T) {
 	}
 
 	back := src + ".back"
-	got, err := os.ReadFile(back) // #nosec G304
+	got, err := os.ReadFile(filepath.Clean(back))
 	if err != nil {
 		t.Fatalf("backup file not created: %v", err)
 	}
@@ -89,7 +91,6 @@ func TestConfigFileOverwritesExistingBackup(t *testing.T) {
 	oldContent := []byte("old content")
 	newContent := []byte("new content")
 
-	// Create a stale backup from a previous run.
 	if err := os.WriteFile(back, oldContent, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestConfigFileOverwritesExistingBackup(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	got, err := os.ReadFile(back) // #nosec G304
+	got, err := os.ReadFile(filepath.Clean(back))
 	if err != nil {
 		t.Fatalf("backup file not found: %v", err)
 	}
@@ -126,15 +127,12 @@ func TestConfigFileSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pass the symlink path — backup must copy the content, not create a
-	// symlink backup.
 	if err := ConfigFile(link); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Backup is created next to the resolved real file.
 	back := realFile + ".back"
-	got, err := os.ReadFile(back) // #nosec G304
+	got, err := os.ReadFile(filepath.Clean(back))
 	if err != nil {
 		t.Fatalf("backup file not created: %v", err)
 	}
@@ -143,7 +141,6 @@ func TestConfigFileSymlink(t *testing.T) {
 		t.Errorf("symlink backup content mismatch: got %q, want %q", got, content)
 	}
 
-	// Backup must be a regular file, not a symlink.
 	info, err := os.Lstat(back)
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +152,6 @@ func TestConfigFileSymlink(t *testing.T) {
 
 func TestConfigFileSourceNotRegular(t *testing.T) {
 	dir := t.TempDir()
-	// A directory is not a regular file — must be rejected.
 	err := ConfigFile(dir)
 	if err == nil {
 		t.Error("expected error for directory source, got nil")
@@ -170,5 +166,163 @@ func TestIsDirWritable(t *testing.T) {
 
 	if fsutil.IsDirWritable("/proc/1") {
 		t.Error("/proc/1 should not be writable")
+	}
+}
+
+func TestConfigFileErrors(t *testing.T) {
+	if err := ConfigFile("relative.yaml"); err == nil {
+		t.Error("expected error for relative path, got nil")
+	}
+
+	if err := ConfigFile("/nonexistent_dir_12345/file.yaml"); err == nil {
+		t.Error("expected error for unwritable parent dir, got nil")
+	}
+
+	dir := t.TempDir()
+	largeFile := filepath.Join(dir, "large.yaml")
+	oversized := make([]byte, maxBackupSize+10)
+	if err := os.WriteFile(largeFile, oversized, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigFile(largeFile); err == nil {
+		t.Error("expected error for file exceeding maxBackupSize, got nil")
+	}
+}
+
+func TestConfigFileSymlinkLoop(t *testing.T) {
+	dir := t.TempDir()
+	linkA := filepath.Join(dir, "linkA")
+	linkB := filepath.Join(dir, "linkB")
+	if err := os.Symlink(linkB, linkA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkA, linkB); err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigFile(linkA); err == nil {
+		t.Error("expected error for symlink loop, got nil")
+	}
+}
+
+func TestAtomicCopyOpenPermissionDenied(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping permission test when running as root")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "no_read.yaml")
+	if err := os.WriteFile(src, []byte("data"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(src, 0o600); err != nil {
+			t.Log(err)
+		}
+	})
+
+	err := atomicCopy(src, filepath.Join(dir, "out.yaml"))
+	if err == nil {
+		t.Error("expected error opening unreadable file, got nil")
+	}
+}
+
+func TestAtomicCopyDstWriteError(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "valid.yaml")
+	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := atomicCopy(src, "/nonexistent_dir_99999/out.yaml")
+	if err == nil {
+		t.Error("expected error writing to invalid dst, got nil")
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read(_ []byte) (int, error) {
+	return 0, errors.New("mock read error")
+}
+
+func TestDefaultFileOperations(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.CreateTemp(dir, "backup-ops-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := defaultFileStat(f); err != nil {
+		t.Errorf("expected success from defaultFileStat, got: %v", err)
+	}
+	if _, err := defaultFileReadAll(strings.NewReader("content")); err != nil {
+		t.Errorf("expected success from defaultFileReadAll, got: %v", err)
+	}
+	if _, err := defaultFileReadAll(errReader{}); err == nil {
+		t.Error("expected error from defaultFileReadAll on errReader, got nil")
+	}
+
+	if err := f.Close(); err != nil {
+		t.Log(err)
+	}
+
+	if err := defaultFileClose(f); err == nil {
+		t.Error("expected error closing already closed file")
+	}
+	if _, err := defaultFileStat(f); err == nil {
+		t.Error("expected error statting already closed file")
+	}
+}
+
+func TestAtomicCopyCloseError(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "close_err.yaml")
+	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origClose := fileClose
+	defer func() { fileClose = origClose }()
+	fileClose = func(_ *os.File) error {
+		return errors.New("mock close error")
+	}
+
+	if err := atomicCopy(src, filepath.Join(dir, "out.yaml")); err == nil {
+		t.Error("expected error when fileClose fails, got nil")
+	}
+}
+
+func TestAtomicCopyStatError(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "stat_err.yaml")
+	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origStat := fileStat
+	defer func() { fileStat = origStat }()
+	fileStat = func(_ *os.File) (os.FileInfo, error) {
+		return nil, errors.New("mock stat error")
+	}
+
+	if err := atomicCopy(src, filepath.Join(dir, "out.yaml")); err == nil {
+		t.Error("expected error when fileStat fails, got nil")
+	}
+}
+
+func TestAtomicCopyReadAllError(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "read_err.yaml")
+	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origRead := fileReadAll
+	defer func() { fileReadAll = origRead }()
+	fileReadAll = func(_ io.Reader) ([]byte, error) {
+		return nil, errors.New("mock read error")
+	}
+
+	if err := atomicCopy(src, filepath.Join(dir, "out.yaml")); err == nil {
+		t.Error("expected error when fileReadAll fails, got nil")
 	}
 }

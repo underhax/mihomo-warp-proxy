@@ -13,23 +13,11 @@ import (
 	"github.com/underhax/mihomo-warp-proxy/internal/validate"
 )
 
-// maxBackupSize mirrors the config file size limit in mihomo/config.go.
-// Both limits must be kept in sync — a config that passes the backup check
-// must also pass the parse check on the next read.
-const maxBackupSize = 1024 * 1024 // 1 MB
+const maxBackupSize = 1024 * 1024
 
 // ConfigFile atomically copies src to src+".back" if src exists, is non-empty,
 // and its parent directory is writable by the current process.
-//
-// The copy is written to a temporary file in the same directory as src and
-// then renamed into place. Same-directory placement guarantees the rename is
-// atomic on POSIX (single filesystem, no cross-device move).
-//
-// A missing src is not an error: there is simply nothing to back up on first run.
 func ConfigFile(src string) error {
-	// Resolve symlinks so the backup is placed next to the real file, not the
-	// link. os.Open below follows the symlink automatically for reading, but
-	// filepath.Dir(src) would point to the link's directory otherwise.
 	if resolved, err := filepath.EvalSymlinks(src); err == nil {
 		src = resolved
 	} else if !os.IsNotExist(err) {
@@ -42,29 +30,56 @@ func ConfigFile(src string) error {
 
 	dir := filepath.Dir(src)
 	if !fsutil.IsDirWritable(dir) {
-		// Non-writable parent means we are operating on a read-only mount.
-		// Log-worthy but not fatal — the caller decides whether to proceed.
 		return fmt.Errorf("backup: parent directory %q is not writable", dir)
 	}
 
 	return atomicCopy(src, src+".back")
 }
 
-// atomicCopy copies src to dst via a temporary file in tmpDir, then renames
-// the temporary file to dst. This ensures dst is never partially written.
-func atomicCopy(src, dst string) error {
-	// #nosec G304 -- File inclusion is intended here. src is either the fixed
-	// mihomo config path or its direct symlink target, protected by validate.Path.
-	in, err := os.Open(src)
+func defaultFileClose(f *os.File) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close file: %w", err)
+	}
+	return nil
+}
+
+func defaultFileStat(f *os.File) (os.FileInfo, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat file: %w", err)
+	}
+	return info, nil
+}
+
+func defaultFileReadAll(r io.Reader) ([]byte, error) {
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+	return buf, nil
+}
+
+var (
+	fileClose   = defaultFileClose
+	fileStat    = defaultFileStat
+	fileReadAll = defaultFileReadAll
+)
+
+func atomicCopy(src, dst string) (retErr error) {
+	in, err := os.Open(filepath.Clean(src))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // A missing src is not an error
+			return nil
 		}
 		return fmt.Errorf("backup: open source %q: %w", src, err)
 	}
-	defer func() { _ = in.Close() }() //nolint:errcheck // read-only file, close error is unactionable
+	defer func() {
+		if cerr := fileClose(in); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("backup: close source %q: %w", src, cerr)
+		}
+	}()
 
-	info, err := in.Stat()
+	info, err := fileStat(in)
 	if err != nil {
 		return fmt.Errorf("backup: stat opened file %q: %w", src, err)
 	}
@@ -78,7 +93,7 @@ func atomicCopy(src, dst string) error {
 	}
 
 	limited := io.LimitReader(in, maxBackupSize+1)
-	buf, err := io.ReadAll(limited)
+	buf, err := fileReadAll(limited)
 	if err != nil {
 		return fmt.Errorf("backup: copy content to temp file: %w", err)
 	}

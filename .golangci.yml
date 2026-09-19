@@ -74,6 +74,8 @@ linters:
         - experimental
         - performance
         - style
+      disabled-checks:
+        - hugeParam
 
     govet:
       enable-all: true
@@ -98,6 +100,22 @@ linters:
         linters:
           - wrapcheck
           - contextcheck
+      - path: cmd/entrypoint/main\.go
+        linters:
+          - gosec
+        text: "G204:"
+      - path: internal/usermode/usermode\.go
+        linters:
+          - gosec
+        text: "(G204|G122):"
+      - path: internal/wgcf/wgcf\.go
+        linters:
+          - gosec
+        text: "G204:"
+      - path: internal/wgcf/wgcf_test\.go
+        linters:
+          - gosec
+        text: "G306:"
 
 formatters:
   enable:

@@ -1,6 +1,5 @@
-// Package validate provides input validation functions used across the
-// entrypoint. Each function is pure (no side effects, no I/O) so the full
-// validation suite can be exercised in unit tests without a live environment.
+// Package validate provides pure input validation functions ensuring paths,
+// network addresses, and configuration parameters comply with security policies.
 package validate
 
 import (
@@ -13,11 +12,8 @@ import (
 	"time"
 )
 
-// Path validates that p is safe to use as a filesystem path in this container.
-// It rejects relative paths, directory traversal, control characters, and
-// paths that resolve into kernel or container-runtime pseudo-filesystems.
-// realpath-style canonicalisation is intentionally avoided here — callers that
-// need symlink resolution must do so explicitly before calling this function.
+// Path validates that p is safe to use as an absolute filesystem path,
+// preventing directory traversal and access to sensitive runtime paths.
 func Path(p, name string) error {
 	if p == "" {
 		return fmt.Errorf("%s: path must not be empty", name)
@@ -27,28 +23,21 @@ func Path(p, name string) error {
 		return fmt.Errorf("%s: path must be absolute, got %q", name, p)
 	}
 
-	// Null bytes terminate C strings and bypass many path checks in the kernel.
 	if strings.ContainsRune(p, 0x00) {
 		return fmt.Errorf("%s: path contains null byte", name)
 	}
 
-	// Control characters other than null are equally dangerous in paths.
 	for i, r := range p {
 		if r < 0x20 && r != 0x00 {
 			return fmt.Errorf("%s: path contains control character at position %d (0x%02x)", name, i, r)
 		}
 	}
 
-	// filepath.Clean resolves ".." components. If the cleaned path differs from
-	// the input only by a trailing slash, that is harmless; any other difference
-	// means traversal sequences were present.
 	cleaned := filepath.Clean(p)
 	if cleaned != p && cleaned+"/" != p {
 		return fmt.Errorf("%s: path contains traversal sequences: %q -> %q", name, p, cleaned)
 	}
 
-	// Whitespace in paths causes silent split bugs in any code that passes
-	// paths as space-delimited strings (e.g. to external tools).
 	if strings.ContainsAny(p, " \t\r\n") {
 		return fmt.Errorf("%s: path contains whitespace: %q", name, p)
 	}
@@ -57,8 +46,6 @@ func Path(p, name string) error {
 		return fmt.Errorf("%s: path exceeds maximum length (4096), got %d", name, len(p))
 	}
 
-	// Block paths into pseudo-filesystems and container runtime sockets.
-	// Access to these from within the container entrypoint is never legitimate.
 	restricted := []string{
 		"/proc", "/sys", "/dev",
 		"/run",
@@ -75,32 +62,23 @@ func Path(p, name string) error {
 	return nil
 }
 
-// IsRestrictedIP returns true when ip must not be contacted from this process.
-// Uses standard library methods as the primary gate, with manual checks only
-// for ranges intentionally excluded from the Go standard library.
+// IsRestrictedIP checks if an IP belongs to private, loopback, link-local,
+// CGNAT, or special-purpose ranges to prevent SSRF vulnerabilities.
 func IsRestrictedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
 
-	// IsPrivate covers RFC 1918 (IPv4) and RFC 4193 (IPv6 ULA fc00::/7).
-	// !IsGlobalUnicast covers everything else that is not a routable public
-	// address: loopback, link-local, multicast, unspecified, broadcast.
 	if ip.IsPrivate() || !ip.IsGlobalUnicast() {
 		return true
 	}
 
-	// CGNAT 100.64.0.0/10 — intentionally excluded from net.IP.IsPrivate()
-	// by the Go standard library; must be checked manually.
-	// ip.To4() unwraps IPv4-mapped IPv6 addresses automatically.
 	if ip4 := ip.To4(); ip4 != nil {
 		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 			return true
 		}
 	}
 
-	// fec0::/10 deprecated IPv6 site-local — not reliably caught by
-	// !IsGlobalUnicast() across all Go versions; explicit check required.
 	if ip16 := ip.To16(); ip16 != nil && ip16[0] == 0xfe && ip16[1]&0xc0 == 0xc0 {
 		return true
 	}
@@ -108,15 +86,22 @@ func IsRestrictedIP(ip net.IP) bool {
 	return false
 }
 
-// ResolveAndValidate resolves hostname to IP addresses and verifies that none
-// of the results map to a restricted range. It is called before every outbound
-// HTTP connection to prevent SSRF via DNS rebinding or internal hostname tricks.
-// An empty result set (NXDOMAIN or no A/AAAA records) is treated as an error
-// because proceeding with an unresolvable host would silently skip the check.
+func defaultLookupHost(ctx context.Context, host string) ([]string, error) {
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("lookup host: %w", err)
+	}
+	return addrs, nil
+}
+
+var lookupHost = defaultLookupHost
+
+// ResolveAndValidate resolves a hostname to IPs and asserts that none resolve
+// to restricted or private addresses to prevent SSRF attacks.
 func ResolveAndValidate(hostname string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	addrs, err := net.DefaultResolver.LookupHost(ctx, hostname)
+	addrs, err := lookupHost(ctx, hostname)
 	if err != nil {
 		return fmt.Errorf("DNS resolution failed for %q: %w", hostname, err)
 	}
@@ -136,18 +121,8 @@ func ResolveAndValidate(hostname string) error {
 	return nil
 }
 
-// AmneziaIParam validates the AmneziaWG v2 init-packet template syntax used
-// in WARP_AMNEZIA_I1–I5. The format is a sequence of typed tags; any
-// unrecognised token or out-of-range numeric is rejected to prevent garbage
-// values from being written into the mihomo config.
-//
-// Accepted tags:
-//
-//	<b 0xHEX>   static bytes (arbitrary hex length)
-//	<c>         32-bit packet counter (network byte order)
-//	<t>         32-bit Unix timestamp (network byte order)
-//	<r N>       N random bytes, 0 <= N <= 1000
-//	<wt N>      wait N ms, 0 <= N <= 5000
+// AmneziaIParam validates the syntax and bounds of AmneziaWG v2 init-packet
+// templates to prevent malformed directives in generated configurations.
 func AmneziaIParam(name, val string) error {
 	if val == "" {
 		return nil
@@ -197,39 +172,34 @@ func AmneziaIParam(name, val string) error {
 	return nil
 }
 
-// parseTagNumeric parses a tag of the form "<prefix N>". It validates the
-// numeric value and returns the remaining string after the closing ">".
 func parseTagNumeric(s, prefix string, minVal, maxVal int) (tail string, err error) {
 	inner, tail, ok := strings.Cut(s[len(prefix):], ">")
 	if !ok {
-		return "", fmt.Errorf("unclosed tag %q in %q", prefix, truncate(s))
+		return "", fmt.Errorf("malformed %s tag (missing '>'): %s", prefix, truncate(s))
 	}
-	_, err = parseTagInt(inner, minVal, maxVal)
-	if err != nil {
-		return "", err
+	if err := parseTagInt(strings.TrimSpace(inner), minVal, maxVal); err != nil {
+		return "", fmt.Errorf("invalid %s tag argument: %w", prefix, err)
 	}
 	return tail, nil
 }
 
-// parseTagInt converts a tag numeric argument string to int within [min, max].
-func parseTagInt(s string, minVal, maxVal int) (int, error) {
+func parseTagInt(s string, minVal, maxVal int) error {
 	if s == "" {
-		return 0, errors.New("missing numeric argument")
+		return errors.New("missing numeric argument")
 	}
 	n := 0
 	for _, r := range s {
 		if r < '0' || r > '9' {
-			return 0, fmt.Errorf("non-numeric character %q in argument %q", r, s)
+			return fmt.Errorf("non-numeric character %q in argument %q", r, s)
 		}
 		n = n*10 + int(r-'0')
 	}
 	if n < minVal || n > maxVal {
-		return 0, fmt.Errorf("value %d out of range [%d, %d]", n, minVal, maxVal)
+		return fmt.Errorf("value %d out of range [%d, %d]", n, minVal, maxVal)
 	}
-	return n, nil
+	return nil
 }
 
-// validateHex checks that s contains only hexadecimal characters.
 func validateHex(s string) error {
 	if s == "" {
 		return errors.New("empty hex value")
@@ -242,8 +212,6 @@ func validateHex(s string) error {
 	return nil
 }
 
-// truncate returns at most 80 characters of s for use in error messages,
-// preventing unbounded output when reporting on malformed user input.
 func truncate(s string) string {
 	const limit = 80
 	if len(s) <= limit {

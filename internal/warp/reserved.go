@@ -1,8 +1,5 @@
-// Package warp fetches the WARP device's reserved bytes from the Cloudflare
-// API. The reserved field is a [3]byte array embedded in the WireGuard
-// handshake that identifies the WARP client to Cloudflare's network.
-// Without it mihomo still connects, but Cloudflare may route the traffic
-// differently or apply stricter rate limits.
+// Package warp fetches the WARP device reserved bytes from the Cloudflare
+// API to identify the client during WireGuard handshakes.
 package warp
 
 import (
@@ -14,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -21,29 +19,21 @@ import (
 	"github.com/underhax/mihomo-warp-proxy/internal/logging"
 )
 
-// maxAccountFileSize caps reads of wgcf-account.toml to prevent OOM.
-const maxAccountFileSize = 64 * 1024 // 64 KB
+const maxAccountFileSize = 64 * 1024
 
 const (
 	warpAPIBase     = "https://api.cloudflareclient.com/v0a2158/reg"
 	apiTimeout      = 30 * time.Second
-	maxResponseSize = 1 * 1024 * 1024 // 1 MB — API responses are small JSON objects
+	maxResponseSize = 1 * 1024 * 1024
 )
 
-// validDeviceID matches UUIDs as produced by wgcf (hex digits and hyphens only).
-// Validating before URL interpolation prevents path traversal into other API endpoints.
 var validDeviceID = regexp.MustCompile(`^[a-fA-F0-9\-]{1,64}$`)
 
-// accountFile is a minimal representation of the fields we need from
-// wgcf-account.toml. Full TOML parsing is used to avoid brittle line-by-line
-// grep logic that would break on key ordering or whitespace changes.
 type accountFields struct {
 	AccessToken string
 	DeviceID    string
 }
 
-// deviceResponse is the subset of the Cloudflare WARP API response that
-// contains the client_id used to derive the reserved bytes.
 type deviceResponse struct {
 	Config struct {
 		ClientID string `json:"client_id"`
@@ -51,12 +41,8 @@ type deviceResponse struct {
 	Error string `json:"error"`
 }
 
-// FetchReserved reads credentials from accountFile, calls the Cloudflare WARP
-// API to retrieve the device's client_id, decodes it from base64, and returns
-// it as a [3]byte array.
-//
-// Failures are non-fatal at the call site — mihomo functions without reserved
-// bytes. Callers should log the error and continue rather than aborting startup.
+// FetchReserved reads device credentials from the account file and retrieves
+// client reserved bytes from the API to configure WireGuard parameters.
 func FetchReserved(accountFile string, log *logging.Logger) ([3]byte, error) {
 	var empty [3]byte
 
@@ -97,10 +83,15 @@ func FetchReserved(accountFile string, log *logging.Logger) ([3]byte, error) {
 	return reserved, nil
 }
 
-// fetchDeviceInfo calls the WARP API and returns the parsed response.
-func fetchDeviceInfo(accessToken, deviceID string) (*deviceResponse, error) {
-	// deviceID is validated against validDeviceID before this call, so URL
-	// interpolation is safe.
+func defaultNewWarpClient() *http.Client {
+	return &http.Client{
+		Timeout: apiTimeout,
+	}
+}
+
+var newWarpClient = defaultNewWarpClient
+
+func defaultFetchDeviceInfo(accessToken, deviceID string) (devResp *deviceResponse, retErr error) {
 	apiURL := fmt.Sprintf("%s/%s", warpAPIBase, deviceID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
@@ -115,17 +106,16 @@ func fetchDeviceInfo(accessToken, deviceID string) (*deviceResponse, error) {
 	req.Header.Set("User-Agent", "okhttp/3.12.1")
 	req.Header.Set("Content-Type", "application/json")
 
-	// Client-level timeout as defense-in-depth beyond the context timeout.
-	// The context handles most cases, but the client timeout catches edge cases
-	// where the context is cancelled improperly.
-	client := &http.Client{
-		Timeout: apiTimeout,
-	}
+	client := newWarpClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("execute API request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // read-only body
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil && retErr == nil {
+			retErr = fmt.Errorf("close API response: %w", closeErr)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
@@ -140,15 +130,13 @@ func fetchDeviceInfo(accessToken, deviceID string) (*deviceResponse, error) {
 	return &result, nil
 }
 
-// decodeClientID base64-decodes the client_id and validates it is exactly
-// 3 bytes. The WARP protocol reserves exactly 3 bytes in the WireGuard
-// handshake for client identification — any other length is invalid.
+var fetchDeviceInfo = defaultFetchDeviceInfo
+
 func decodeClientID(clientID string) ([3]byte, error) {
 	var result [3]byte
 
 	decoded, err := base64.StdEncoding.DecodeString(clientID)
 	if err != nil {
-		// Some WARP API versions use URL-safe base64 without padding.
 		decoded, err = base64.RawURLEncoding.DecodeString(clientID)
 		if err != nil {
 			return result, fmt.Errorf("base64 decode failed: %w", err)
@@ -163,20 +151,38 @@ func decodeClientID(clientID string) ([3]byte, error) {
 	return result, nil
 }
 
-// parseAccountFile extracts access_token and device_id from the TOML file
-// written by wgcf. We use a simple line scanner rather than a full TOML
-// parser to avoid adding a dependency for a two-field extraction.
-// The format produced by wgcf is stable and well-known.
-func parseAccountFile(path string) (*accountFields, error) {
-	// #nosec G304 -- Path is strictly internal (cfg.Paths.WgcfAccountFile),
-	// verified by the caller (checkFilePermissions).
-	f, err := os.Open(path)
+func defaultFileClose(f *os.File) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close file: %w", err)
+	}
+	return nil
+}
+
+func defaultFileReadAll(r io.Reader) ([]byte, error) {
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+	return buf, nil
+}
+
+var (
+	fileClose   = defaultFileClose
+	fileReadAll = defaultFileReadAll
+)
+
+func parseAccountFile(path string) (fields *accountFields, retErr error) {
+	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, fmt.Errorf("open account file: %w", err)
 	}
-	defer func() { _ = f.Close() }() //nolint:errcheck // read-only file
+	defer func() {
+		if closeErr := fileClose(f); closeErr != nil && retErr == nil {
+			retErr = fmt.Errorf("close account file: %w", closeErr)
+		}
+	}()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxAccountFileSize+1))
+	data, err := fileReadAll(io.LimitReader(f, maxAccountFileSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read account file: %w", err)
 	}
@@ -184,7 +190,7 @@ func parseAccountFile(path string) (*accountFields, error) {
 		return nil, fmt.Errorf("account file %q exceeds 64KB limit", path)
 	}
 
-	fields := &accountFields{}
+	parsed := &accountFields{}
 	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -199,24 +205,22 @@ func parseAccountFile(path string) (*accountFields, error) {
 
 		switch key {
 		case "access_token":
-			fields.AccessToken = value
+			parsed.AccessToken = value
 		case "device_id":
-			fields.DeviceID = value
+			parsed.DeviceID = value
 		}
 	}
 
-	if fields.AccessToken == "" {
+	if parsed.AccessToken == "" {
 		return nil, fmt.Errorf("access_token not found in %q", path)
 	}
-	if fields.DeviceID == "" {
+	if parsed.DeviceID == "" {
 		return nil, fmt.Errorf("device_id not found in %q", path)
 	}
 
-	return fields, nil
+	return parsed, nil
 }
 
-// checkFilePermissions rejects account files with permissions broader than
-// 0o600 to prevent credential exposure via world-readable files.
 func checkFilePermissions(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
