@@ -542,12 +542,10 @@ func validatePasswordComplexity(pass string) error {
 }
 
 func validateWarpEndpoint(endpoint string) error {
-	lastColon := strings.LastIndex(endpoint, ":")
-	if lastColon < 0 {
+	host, port, found := strings.CutLast(endpoint, ":")
+	if !found {
 		return fmt.Errorf("%s: missing port in %q", contract.EnvWarpEndpoint, endpoint)
 	}
-	host := endpoint[:lastColon]
-	port := endpoint[lastColon+1:]
 
 	const warpEndpointRequirements = contract.EnvWarpEndpoint + " requirements: host must be engage.cloudflareclient.com; port must be one of: 2408, 500, 1701, 4500"
 
