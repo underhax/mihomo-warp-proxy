@@ -111,7 +111,7 @@ jobs:
 
       - name: Prepare mock environment for Compose validation
         run: |
-          cp env-example .env
+          cp .env.example .env
           sed -i 's/^APP_UID=.*/APP_UID=1000/' .env
           sed -i 's/^APP_GID=.*/APP_GID=1000/' .env
 
