@@ -1,6 +1,9 @@
 package config
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -24,6 +27,7 @@ func testCreds() (user, pass string) {
 }
 
 func TestParseBoolEnv(t *testing.T) {
+	r := &envResolver{}
 	cases := []struct {
 		key     string
 		val     string
@@ -50,7 +54,7 @@ func TestParseBoolEnv(t *testing.T) {
 		defaultLabel := strconv.FormatBool(tc.def)
 		t.Run(tc.val+"_default_"+defaultLabel, func(t *testing.T) {
 			t.Setenv(tc.key, tc.val)
-			got, err := parseBoolEnv(tc.key, tc.def)
+			got, err := r.parseBool(tc.key, tc.def)
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("expected error for value %q, got nil", tc.val)
@@ -62,18 +66,19 @@ func TestParseBoolEnv(t *testing.T) {
 				return
 			}
 			if got != tc.want {
-				t.Errorf("parseBoolEnv(%q) = %v, want %v", tc.val, got, tc.want)
+				t.Errorf("parseBool(%q) = %v, want %v", tc.val, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestParseUint32Env(t *testing.T) {
+func TestEnvResolverParseNumbers(t *testing.T) {
+	r := &envResolver{}
 	cases := []struct {
 		val     string
-		min     uint32
-		max     uint32
-		want    uint32
+		min     uint16
+		max     uint16
+		want    uint16
 		wantErr bool
 	}{
 		{"911", 0, 65535, 911, false},
@@ -90,7 +95,7 @@ func TestParseUint32Env(t *testing.T) {
 	for _, tc := range cases {
 		t.Run("val_"+tc.val, func(t *testing.T) {
 			t.Setenv("TEST_UINT", tc.val)
-			got, err := parseUint32Env("TEST_UINT", "0", tc.min, tc.max)
+			got, err := r.parseUint16("TEST_UINT", "0", tc.min, tc.max)
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("expected error for value %q, got nil", tc.val)
@@ -154,7 +159,7 @@ func TestValidateCredentialPair(t *testing.T) {
 		pass    string
 		wantErr bool
 	}{
-		{"both empty — open proxy rejected", "", "", true},
+		{"both empty — unauthenticated proxy allowed", "", "", false},
 		{"user only", validUser, "", true},
 		{"pass only", "", validPass, true},
 		{"valid pair", validUser, validPass, false},
@@ -291,12 +296,11 @@ func TestIsIPv4(t *testing.T) {
 func TestLoadDefaults(t *testing.T) {
 	user, pass := testCreds()
 	for _, k := range []string{
-		contract.EnvTZ, contract.EnvScriptLogLevel, contract.EnvProxyLogLevel,
-		contract.EnvProxyUID, contract.EnvProxyGID, contract.EnvProxyPort,
-		contract.EnvMultiUserMode, contract.EnvUseIP6,
+		contract.EnvScriptLogLevel, contract.EnvProxyLogLevel,
+		contract.EnvProxyPort, contract.EnvUseIP6,
 		contract.EnvGeo, contract.EnvGeoRedownload,
 		contract.EnvGeoURLGeoIP, contract.EnvGeoURLGeoSite, contract.EnvGeoURLMMDB, contract.EnvGeoURLASN,
-		contract.EnvGeoAuthUser, contract.EnvGeoAuthSecret,
+		contract.EnvGeoAuthUser, contract.EnvGeoAuth,
 		contract.EnvUseWarpConfig, contract.EnvWarpRegenerate, contract.EnvWarpPlusKey,
 		contract.EnvWarpEndpoint, contract.EnvWarpDNS, contract.EnvWarpAmnezia,
 	} {
@@ -309,17 +313,8 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("Load() with defaults failed: %v", err)
 	}
 
-	if cfg.ProxyUID != 911 {
-		t.Errorf("ProxyUID: got %d, want 911", cfg.ProxyUID)
-	}
-	if cfg.ProxyGID != 911 {
-		t.Errorf("ProxyGID: got %d, want 911", cfg.ProxyGID)
-	}
 	if cfg.ProxyPort != 7890 {
 		t.Errorf("ProxyPort: got %d, want 7890", cfg.ProxyPort)
-	}
-	if !cfg.MultiUserMode {
-		t.Error("MultiUserMode: got false, want true")
 	}
 	if !cfg.UseIP6 {
 		t.Error("UseIP6: got false, want true")
@@ -344,11 +339,35 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadEmptyCredentialsRejected(t *testing.T) {
+func TestLoadEmptyCredentialsAllowed(t *testing.T) {
 	setEnv(t, contract.EnvProxyUser, "", contract.EnvProxyPass, "")
-	_, err := Load("test")
-	if err == nil {
-		t.Error("expected error for empty credentials, got nil")
+	cfg, err := Load("test")
+	if err != nil {
+		t.Fatalf("expected nil error for empty credentials, got: %v", err)
+	}
+	if cfg.ProxyUser != "" || cfg.ProxyPass != "" {
+		t.Errorf("expected empty credentials, got user=%q pass=%q", cfg.ProxyUser, cfg.ProxyPass)
+	}
+}
+
+func TestLoadPartialCredentialsRejected(t *testing.T) {
+	user, pass := testCreds()
+	cases := []struct {
+		name string
+		user string
+		pass string
+	}{
+		{"user without pass", user, ""},
+		{"pass without user", "", pass},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setEnv(t, contract.EnvProxyUser, tc.user, contract.EnvProxyPass, tc.pass)
+			if _, err := Load("test"); err == nil {
+				t.Error("expected error for partial credentials, got nil")
+			}
+		})
 	}
 }
 
@@ -399,7 +418,7 @@ func TestLoadGeoAuthPartialCredentials(t *testing.T) {
 	setEnv(t,
 		contract.EnvProxyUser, user, contract.EnvProxyPass, pass,
 		contract.EnvGeoAuthUser, "user",
-		contract.EnvGeoAuthSecret, "",
+		contract.EnvGeoAuth, "",
 	)
 	_, err := Load("test")
 	if err == nil {
@@ -419,42 +438,192 @@ func TestLoadInvalidProxyLogLevel(t *testing.T) {
 	}
 }
 
-func TestLoadProxyUIDGIDValidation(t *testing.T) {
+func TestLoadSensitiveEnvAndSecretPrecedence(t *testing.T) {
 	user, pass := testCreds()
-	base := []string{contract.EnvProxyUser, user, contract.EnvProxyPass, pass}
+	t.Setenv(contract.EnvProxyUser, user)
+	t.Setenv(contract.EnvProxyPass, pass)
 
-	cases := []struct {
-		name    string
-		uid     string
-		gid     string
-		wantErr bool
-	}{
-		{"default (911:911)", "", "", false},
-		{"min allowed (1:1)", "1", "1", false},
-		{"max allowed (65535:65535)", "65535", "65535", false},
-		{"zero uid rejected", "0", "911", true},
-		{"zero gid rejected", "911", "0", true},
-		{"above max uid", "65536", "911", true},
-		{"above max gid", "911", "65536", true},
-		{"negative uid", "-1", "911", true},
-		{"non-numeric uid", "abc", "911", true},
+	cfg, err := Load("test")
+	if err != nil {
+		t.Fatalf("unexpected error loading config with env vars: %v", err)
+	}
+	if cfg.ProxyPass != pass {
+		t.Fatalf("expected proxy pass %q, got %q", pass, cfg.ProxyPass)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			args := make([]string, len(base), len(base)+4)
-			copy(args, base)
-			args = append(args, contract.EnvProxyUID, tc.uid, contract.EnvProxyGID, tc.gid)
-			setEnv(t, args...)
-			_, err := Load("test")
-			if tc.wantErr && err == nil {
-				t.Errorf("expected error, got nil")
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-		})
+	secretDir := t.TempDir()
+	secretPass := "SecretPassFromDockerSecret1234567890"
+	if writeErr := os.WriteFile(filepath.Join(secretDir, "mwp_proxy_pass"), []byte(secretPass+"\n"), 0o600); writeErr != nil {
+		t.Fatal(writeErr)
 	}
+	origSecretsDir := secretsDir
+	secretsDir = secretDir
+	t.Cleanup(func() { secretsDir = origSecretsDir })
+
+	cfgSecret, err := Load("test")
+	if err != nil {
+		t.Fatalf("unexpected error loading config with secret: %v", err)
+	}
+	if cfgSecret.ProxyPass != secretPass {
+		t.Fatalf("expected secret precedence %q, got %q", secretPass, cfgSecret.ProxyPass)
+	}
+}
+
+func mockOsStatError(_ string) (os.FileInfo, error) {
+	return nil, errors.New("mock stat error")
+}
+
+func mockOsReadFileError(_ string) ([]byte, error) {
+	return nil, errors.New("mock read file error")
+}
+
+func mockOsReadDirError(_ string) ([]os.DirEntry, error) {
+	return nil, errors.New("mock read dir error")
+}
+
+func TestLoadSecretsOverride(t *testing.T) {
+	user, pass := testCreds()
+	tempDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(tempDir, "mwp_proxy_user"), []byte(user+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "mwp_proxy_pass"), []byte(pass+"\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "mwp_proxy_port"), []byte("8888\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "mwp_use_ip6"), []byte("true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "non_mwp_file"), []byte("ignored"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "mwp_"), []byte("empty_key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PROXY_PORT", "7890")
+	origSecretsDir := secretsDir
+	secretsDir = tempDir
+	t.Cleanup(func() { secretsDir = origSecretsDir })
+
+	cfg, err := Load("test")
+	if err != nil {
+		t.Fatalf("Load with secrets failed: %v", err)
+	}
+
+	if cfg.ProxyPort != 8888 {
+		t.Errorf("ProxyPort secret override failed: got %d, want 8888", cfg.ProxyPort)
+	}
+	if cfg.ProxyUser != user {
+		t.Errorf("ProxyUser secret mismatch: got %q, want %q", cfg.ProxyUser, user)
+	}
+	if cfg.ProxyPass != pass {
+		t.Errorf("ProxyPass secret mismatch: got %q, want %q", cfg.ProxyPass, pass)
+	}
+	if !cfg.UseIP6 {
+		t.Errorf("UseIP6 secret override failed: got %v, want true", cfg.UseIP6)
+	}
+}
+
+func TestLoadSecretsErrors(t *testing.T) {
+	t.Run("secret file exceeds max size", func(t *testing.T) {
+		dir := t.TempDir()
+		hugeData := strings.Repeat("A", 4097)
+		if err := os.WriteFile(filepath.Join(dir, "mwp_proxy_pass"), []byte(hugeData), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		origSecretsDir := secretsDir
+		secretsDir = dir
+		t.Cleanup(func() { secretsDir = origSecretsDir })
+
+		_, err := Load("test")
+		if err == nil || !strings.Contains(err.Error(), "exceeds 4096 bytes") {
+			t.Fatalf("expected size error, got: %v", err)
+		}
+	})
+
+	t.Run("secret file empty", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "mwp_proxy_pass"), []byte("   \r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		origSecretsDir := secretsDir
+		secretsDir = dir
+		t.Cleanup(func() { secretsDir = origSecretsDir })
+
+		_, err := Load("test")
+		if err == nil || !strings.Contains(err.Error(), "is empty") {
+			t.Fatalf("expected empty error, got: %v", err)
+		}
+	})
+
+	t.Run("secret is directory", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "mwp_proxy_pass"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		origSecretsDir := secretsDir
+		secretsDir = dir
+		t.Cleanup(func() { secretsDir = origSecretsDir })
+
+		_, err := Load("test")
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("expected regular file error, got: %v", err)
+		}
+	})
+
+	t.Run("load secrets read dir error", func(t *testing.T) {
+		origReadDir := osReadDir
+		osReadDir = mockOsReadDirError
+		t.Cleanup(func() { osReadDir = origReadDir })
+
+		dir := t.TempDir()
+		_, err := defaultLoadSecrets(dir)
+		if err == nil || !strings.Contains(err.Error(), "read secrets directory") {
+			t.Fatalf("expected read dir error, got: %v", err)
+		}
+	})
+}
+
+func TestReadSecretErrors(t *testing.T) {
+	t.Run("secret path traversal", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := defaultReadSecret(dir, "../secret")
+		if err == nil || !strings.Contains(err.Error(), "invalid secret path") {
+			t.Fatalf("expected path traversal error, got: %v", err)
+		}
+	})
+
+	t.Run("secret stat error", func(t *testing.T) {
+		origStat := osStat
+		osStat = mockOsStatError
+		t.Cleanup(func() { osStat = origStat })
+
+		dir := t.TempDir()
+		_, err := defaultReadSecret(dir, "mwp_proxy_pass")
+		if err == nil || !strings.Contains(err.Error(), "stat secret") {
+			t.Fatalf("expected stat error, got: %v", err)
+		}
+	})
+
+	t.Run("secret read file error", func(t *testing.T) {
+		dir := t.TempDir()
+		secretFile := filepath.Join(dir, "mwp_proxy_pass")
+		if err := os.WriteFile(secretFile, []byte("valid"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		origReadFile := osReadFile
+		osReadFile = mockOsReadFileError
+		t.Cleanup(func() { osReadFile = origReadFile })
+
+		_, err := defaultReadSecret(dir, "mwp_proxy_pass")
+		if err == nil || !strings.Contains(err.Error(), "read secret") {
+			t.Fatalf("expected read secret error, got: %v", err)
+		}
+	})
 }
 
 func TestFilterEnviron(t *testing.T) {
@@ -463,15 +632,15 @@ func TestFilterEnviron(t *testing.T) {
 		contract.EnvProxyUser + "=admin",
 		contract.EnvProxyPass + "=supersecret32chars!!!",
 		contract.EnvGeoAuthUser + "=alice",
-		contract.EnvGeoAuthSecret + "=bob",
+		contract.EnvGeoAuth + "=bob",
 		contract.EnvWarpPlusKey + "=1234-5678-90ab",
-		contract.EnvTZ + "=UTC",
+		"EXTRA_VAR=value",
 		"INVALID_ENV_VAR",
 	}
 	want := []string{
 		"PATH=/usr/local/sbin:/usr/local/bin",
 		contract.EnvProxyUser + "=admin",
-		contract.EnvTZ + "=UTC",
+		"EXTRA_VAR=value",
 		"INVALID_ENV_VAR",
 	}
 
@@ -543,23 +712,15 @@ func TestValidateGeoCredential(t *testing.T) {
 	}
 }
 
-func TestValidateTZ(t *testing.T) {
-	if err := validateTZ("UTC"); err != nil {
-		t.Errorf("validateTZ(UTC) error: %v", err)
-	}
-	if err := validateTZ("Nonexistent/Invalid_Timezone"); err == nil {
-		t.Error("expected error for invalid timezone, got nil")
-	}
-}
-
 func TestParseUint16AndIntEnvErrors(t *testing.T) {
+	r := &envResolver{}
 	t.Setenv("TEST_UINT16", "notanumber")
-	if _, err := parseUint16Env("TEST_UINT16", "10", 1, 100); err == nil {
+	if _, err := r.parseUint16("TEST_UINT16", "10", 1, 100); err == nil {
 		t.Error("expected error for invalid uint16, got nil")
 	}
 
 	t.Setenv("TEST_INT", "notanumber")
-	if _, err := parseIntEnv("TEST_INT", "10", 1, 100); err == nil {
+	if _, err := r.parseInt("TEST_INT", "10", 1, 100); err == nil {
 		t.Error("expected error for invalid int, got nil")
 	}
 
@@ -651,15 +812,17 @@ func TestLoadConfigErrors(t *testing.T) {
 	})
 
 	t.Run("uint16 out of range", func(t *testing.T) {
+		r := &envResolver{}
 		t.Setenv("TEST_UINT16_RANGE", "200")
-		if _, err := parseUint16Env("TEST_UINT16_RANGE", "10", 1, 100); err == nil {
+		if _, err := r.parseUint16("TEST_UINT16_RANGE", "10", 1, 100); err == nil {
 			t.Error("expected error for uint16 out of range, got nil")
 		}
 	})
 
 	t.Run("int out of range", func(t *testing.T) {
+		r := &envResolver{}
 		t.Setenv("TEST_INT_RANGE", "200")
-		if _, err := parseIntEnv("TEST_INT_RANGE", "10", 1, 100); err == nil {
+		if _, err := r.parseInt("TEST_INT_RANGE", "10", 1, 100); err == nil {
 			t.Error("expected error for int out of range, got nil")
 		}
 	})
@@ -741,8 +904,6 @@ func TestValidatePathsError(t *testing.T) {
 		WgcfProfileFile:  "/valid/profile.conf",
 		MihomoBin:        "/bin/../bin",
 		WgcfBin:          "/valid/bin",
-		SuExecBin:        "/valid/suexec",
-		VersionFile:      "/valid/version",
 	}
 	if err := validatePaths(p); err == nil {
 		t.Error("expected error for path traversal in MihomoBin, got nil")
@@ -754,7 +915,7 @@ func TestLoadConfigGeoAndAmneziaErrors(t *testing.T) {
 	base := []string{contract.EnvProxyUser, user, contract.EnvProxyPass, pass}
 
 	t.Run("geo user set without pass", func(t *testing.T) {
-		args := append(slicesClone(base), contract.EnvGeoAuthUser, "geouser", contract.EnvGeoAuthSecret, "")
+		args := append(slicesClone(base), contract.EnvGeoAuthUser, "geouser", contract.EnvGeoAuth, "")
 		setEnv(t, args...)
 		if _, err := Load("test"); err == nil {
 			t.Error("expected error when geo user is set without secret, got nil")
@@ -800,14 +961,6 @@ func TestLoadRemainingValidationErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid tz", func(t *testing.T) {
-		args := append(slicesClone(base), contract.EnvTZ, "Bad/Timezone!")
-		setEnv(t, args...)
-		if _, err := Load("test"); err == nil {
-			t.Error("expected error for invalid TZ, got nil")
-		}
-	})
-
 	t.Run("invalid script log level", func(t *testing.T) {
 		args := append(slicesClone(base), contract.EnvScriptLogLevel, "NONEXISTENT")
 		setEnv(t, args...)
@@ -821,14 +974,6 @@ func TestLoadRemainingValidationErrors(t *testing.T) {
 		setEnv(t, args...)
 		if _, err := Load("test"); err == nil {
 			t.Error("expected error for out of range PROXY_PORT, got nil")
-		}
-	})
-
-	t.Run("invalid multi user mode bool", func(t *testing.T) {
-		args := append(slicesClone(base), contract.EnvMultiUserMode, "not-a-bool")
-		setEnv(t, args...)
-		if _, err := Load("test"); err == nil {
-			t.Error("expected error for invalid MULTI_USER_MODE, got nil")
 		}
 	})
 
@@ -849,7 +994,7 @@ func TestLoadRemainingValidationErrors(t *testing.T) {
 	})
 
 	t.Run("invalid geo auth user credential", func(t *testing.T) {
-		args := append(slicesClone(base), contract.EnvGeoAuthUser, "bad:user", contract.EnvGeoAuthSecret, "validpass")
+		args := append(slicesClone(base), contract.EnvGeoAuthUser, "bad:user", contract.EnvGeoAuth, "validpass")
 		setEnv(t, args...)
 		if _, err := Load("test"); err == nil {
 			t.Error("expected error for invalid GEO_AUTH_USER, got nil")
@@ -857,7 +1002,7 @@ func TestLoadRemainingValidationErrors(t *testing.T) {
 	})
 
 	t.Run("invalid geo auth secret credential", func(t *testing.T) {
-		args := append(slicesClone(base), contract.EnvGeoAuthUser, "validuser", contract.EnvGeoAuthSecret, "bad:pass")
+		args := append(slicesClone(base), contract.EnvGeoAuthUser, "validuser", contract.EnvGeoAuth, "bad:pass")
 		setEnv(t, args...)
 		if _, err := Load("test"); err == nil {
 			t.Error("expected error for invalid GEO_AUTH_PASS, got nil")

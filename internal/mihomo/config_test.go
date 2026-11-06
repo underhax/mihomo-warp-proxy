@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
 	"github.com/underhax/mihomo-warp-proxy/internal/logging"
@@ -18,7 +18,7 @@ import (
 
 var (
 	testProfile = &wgcf.Profile{
-		PrivateKey: "YH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZEEEE=",
+		PrivateKey: "bAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 		PublicKey:  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
 		IPv4:       "172.16.0.2",
 		IPv6:       "2606:4700:110:8949:fed8:548c:4603:5b00",
@@ -243,7 +243,7 @@ proxies:
     ip: 172.16.0.2
     ipv6: "2606:4700::1"
     public-key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-    private-key: "YH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZEEEE="
+    private-key: "bAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     udp: true
     mtu: 1280
     dns:

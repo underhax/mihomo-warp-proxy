@@ -1,5 +1,5 @@
-// Package geo downloads and caches geodata files required by mihomo,
-// enforcing strict HTTPS and DNS rebinding protections against SSRF.
+// Package geo manages the retrieval and caching of geodata routing databases
+// while enforcing SSRF protections and payload integrity verification.
 package geo
 
 import (
@@ -15,10 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
 	"github.com/underhax/mihomo-warp-proxy/internal/logging"
@@ -41,9 +40,9 @@ var (
 	httpNewRequestWithContext = http.NewRequestWithContext
 )
 
-// PrepareGeoFiles downloads all configured geodata files in parallel, verifying
-// content integrity and caching metadata to skip unchanged resources.
-func PrepareGeoFiles(cfg *config.Config, log *logging.Logger) error {
+// PrepareGeoFiles synchronizes geodata databases concurrently to provide up-to-date
+// IP and domain classification tables for mihomo routing.
+func PrepareGeoFiles(ctx context.Context, cfg *config.Config, log *logging.Logger) error {
 	urls := []struct {
 		url string
 		dst string
@@ -56,19 +55,28 @@ func PrepareGeoFiles(cfg *config.Config, log *logging.Logger) error {
 
 	client := newHTTPClient()
 
-	g := &errgroup.Group{}
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
 	for _, entry := range urls {
-		g.Go(func() error {
-			return download(client, cfg, log, entry.url, entry.dst)
+		wg.Go(func() {
+			if err := download(ctx, client, cfg, log, entry.url, entry.dst); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("geo: sync downloads: %w", err)
+	wg.Wait()
+	if len(errs) > 0 {
+		return fmt.Errorf("geo: sync downloads: %w", errors.Join(errs...))
 	}
 	return nil
 }
 
-func download(client *http.Client, cfg *config.Config, log *logging.Logger, rawURL, dst string) error {
+func download(ctx context.Context, client *http.Client, cfg *config.Config, log *logging.Logger, rawURL, dst string) error {
 	if err := validateGeoURL(rawURL); err != nil {
 		return fmt.Errorf("geo: invalid URL %q: %w", rawURL, err)
 	}
@@ -81,7 +89,7 @@ func download(client *http.Client, cfg *config.Config, log *logging.Logger, rawU
 
 	log.Debugf("geo: checking %s -> %s", rawURL, dst)
 
-	meta, finalURL, err := fetchMeta(client, cfg, rawURL, origHost)
+	meta, finalURL, err := fetchMeta(ctx, client, cfg, rawURL, origHost)
 	if err != nil {
 		return fmt.Errorf("geo: HEAD %q: %w", rawURL, err)
 	}
@@ -95,7 +103,7 @@ func download(client *http.Client, cfg *config.Config, log *logging.Logger, rawU
 	}
 
 	log.Debugf("geo: downloading %s", filepath.Base(dst))
-	if err := streamToFile(client, cfg, finalURL, origHost, dst); err != nil {
+	if err := streamToFile(ctx, client, cfg, finalURL, origHost, dst); err != nil {
 		return fmt.Errorf("geo: download %q: %w", rawURL, err)
 	}
 
@@ -111,7 +119,7 @@ func download(client *http.Client, cfg *config.Config, log *logging.Logger, rawU
 	return nil
 }
 
-func fetchMeta(client *http.Client, cfg *config.Config, rawURL, origHost string) (http.Header, string, error) {
+func fetchMeta(ctx context.Context, client *http.Client, cfg *config.Config, rawURL, origHost string) (http.Header, string, error) {
 	current := rawURL
 
 	for range maxRedirects {
@@ -119,8 +127,8 @@ func fetchMeta(client *http.Client, cfg *config.Config, rawURL, origHost string)
 			return nil, "", fmt.Errorf("redirect target invalid: %w", err)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), headTimeout)
-		req, err := httpNewRequestWithContext(ctx, http.MethodHead, current, http.NoBody)
+		headCtx, cancel := context.WithTimeout(ctx, headTimeout)
+		req, err := httpNewRequestWithContext(headCtx, http.MethodHead, current, http.NoBody)
 		if err != nil {
 			cancel()
 			return nil, "", fmt.Errorf("create HEAD request: %w", err)
@@ -160,11 +168,11 @@ func fetchMeta(client *http.Client, cfg *config.Config, rawURL, origHost string)
 	return nil, "", fmt.Errorf("exceeded %d redirects for %s", maxRedirects, rawURL)
 }
 
-func streamToFile(client *http.Client, cfg *config.Config, rawURL, origHost, dst string) (retErr error) {
-	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+func streamToFile(ctx context.Context, client *http.Client, cfg *config.Config, rawURL, origHost, dst string) (retErr error) {
+	dlCtx, cancel := context.WithTimeout(ctx, downloadTimeout)
 	defer cancel()
 
-	resp, err := openDownloadStream(ctx, client, cfg, rawURL, origHost)
+	resp, err := openDownloadStream(dlCtx, client, cfg, rawURL, origHost)
 	if err != nil {
 		return err
 	}

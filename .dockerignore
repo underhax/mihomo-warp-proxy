@@ -1,6 +1,0 @@
-.env
-.env.*
-!.env.example
-mihomo-data/
-wgcf-data/
-.git/

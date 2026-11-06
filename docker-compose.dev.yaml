@@ -1,106 +1,50 @@
 name: mihomo-warp-proxy-dev
 
-# Local development compose file — builds the image from the cloned repository
-# source instead of pulling from the registry.
-# Security considerations for local builds: https://github.com/underhax/mihomo-warp-proxy?tab=readme-ov-file#security-considerations-for-local-builds
-#
-# Usage:
-#   docker compose -f docker-compose.dev.yaml up --build
-# or:
-#   docker compose -f docker-compose.dev.yaml build --no-cache && docker compose -f docker-compose.dev.yaml up
-
 services:
-  mihomo-proxy:
+  mihomo:
     build:
       context: .
       args:
         # v1 = baseline x86-64, v2 = SSE4.2, v3 = AVX2.
         # To detect your level:
-        #   grep -q avx2 /proc/cpuinfo && echo v3 || { grep -q sse4_2 /proc/cpuinfo && echo v2 || echo v1; }
+        #   awk '/flags/{if (/avx2/) {print "v3"; exit} if (/sse4_2/) {print "v2"; exit} print "v1"; exit}' /proc/cpuinfo
         MIHOMO_CPU_VARIANT: ${MIHOMO_CPU_VARIANT:-v1}
     image: mihomo-warp-proxy-dev:local
     pull_policy: never
-    container_name: mihomo-warp-proxy-dev
-    hostname: mihomo-warp-proxy-dev
+    container_name: mihomo-dev
+    hostname: mihomo-dev
     restart: on-failure:3
-    healthcheck:
-      test:
-        - "CMD-SHELL"
-        - >
-          curl -sf --socks5-hostname localhost:${PROXY_PORT:-7890}
-          --proxy-user "${PROXY_USER}:${PROXY_PASS}"
-          https://cp.cloudflare.com/generate_204 || exit 1
-      interval: 30s
-      timeout: 30s
-      retries: 3
-      start_period: 30s
-    env_file:
-    # https://raw.githubusercontent.com/underhax/mihomo-warp-proxy/main/env-example
-      - path: .env
-        required: false
-    # Full description of all variables:
-    # https://github.com/underhax/mihomo-warp-proxy#configuration
-    environment:
-      MIHOMO_CPU_VARIANT: ${MIHOMO_CPU_VARIANT:-v1}
-      TZ: ${TZ:-UTC}
-      SCRIPT_LOG_LEVEL: ${SCRIPT_LOG_LEVEL:-ERROR}
-      PROXY_LOG_LEVEL: ${PROXY_LOG_LEVEL:-error}
-      PROXY_UID: ${PROXY_UID:-911}
-      PROXY_GID: ${PROXY_GID:-911}
-      PROXY_PORT: ${PROXY_PORT:-7890}
-      PROXY_USER: ${PROXY_USER:-}
-      PROXY_PASS: ${PROXY_PASS:-}
-      USE_IP6: ${USE_IP6:-true}
-      GEO: ${GEO:-false}
-      GEO_REDOWNLOAD: ${GEO_REDOWNLOAD:-false}
-      GEO_URL_GEOIP: ${GEO_URL_GEOIP:-}
-      GEO_URL_GEOSITE: ${GEO_URL_GEOSITE:-}
-      GEO_URL_MMDB: ${GEO_URL_MMDB:-}
-      GEO_URL_ASN: ${GEO_URL_ASN:-}
-      GEO_AUTH_USER: ${GEO_AUTH_USER:-}
-      GEO_AUTH_PASS: ${GEO_AUTH_PASS:-}
-      USE_WARP_CONFIG: ${USE_WARP_CONFIG:-true}
-      WARP_REGENERATE: ${WARP_REGENERATE:-false}
-      WARP_PLUS_KEY: ${WARP_PLUS_KEY:-}
-      WARP_ENDPOINT: ${WARP_ENDPOINT:-engage.cloudflareclient.com:500}
-      WARP_DNS: ${WARP_DNS:-1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001}
-      WARP_AMNEZIA: ${WARP_AMNEZIA:-false}
-      WARP_AMNEZIA_JC: ${WARP_AMNEZIA_JC:-}
-      WARP_AMNEZIA_JMIN: ${WARP_AMNEZIA_JMIN:-}
-      WARP_AMNEZIA_JMAX: ${WARP_AMNEZIA_JMAX:-}
-      WARP_AMNEZIA_I1: ${WARP_AMNEZIA_I1:-}
-      WARP_AMNEZIA_I2: ${WARP_AMNEZIA_I2:-}
-      WARP_AMNEZIA_I3: ${WARP_AMNEZIA_I3:-}
-      WARP_AMNEZIA_I4: ${WARP_AMNEZIA_I4:-}
-      WARP_AMNEZIA_I5: ${WARP_AMNEZIA_I5:-}
-    volumes:
-      - ./mihomo-data:/app/mihomo:rw
-      - ./wgcf-data:/app/wgcf:rw
-    ports:
-      - "127.0.0.1:${PROXY_PORT:-7890}:${PROXY_PORT:-7890}"
-    networks:
-      - proxy
+    user: "${APP_UID}:${APP_GID}"
+    read_only: true
+    ipc: none
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    cap_add:
-      - SETUID
-      - SETGID
-      - CHOWN
-      - KILL
-      # Uncomment NET_BIND_SERVICE if you need to bind ports below 1024 — for example, when adding a custom VLESS or HTTPS listener on port 443 in config.yaml.
-      # - NET_BIND_SERVICE
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-      nproc:
-        soft: 512
-        hard: 512
-      memlock:
-        soft: 65536
-        hard: 65536
+    cap_add: []
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/mihomo:rw,noexec,nosuid,nodev
+      - ./wgcf:/app/wgcf:rw,noexec,nosuid,nodev
+      - /etc/localtime:/etc/localtime:ro
+    tmpfs:
+      - /run:mode=1777,size=16m,noexec,nosuid,nodev
+      - /tmp:mode=1777,size=64m,noexec,nosuid,nodev
+    networks:
+      - mihomo_dev
+    environment:
+      - SCRIPT_LOG_LEVEL=DEBUG
+      - PROXY_LOG_LEVEL=debug
+    healthcheck:
+      test:
+        - "CMD"
+        - "/usr/local/bin/entrypoint"
+        - "health"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     logging:
       options:
         max-size: "10M"
@@ -108,10 +52,38 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "1.0"
           memory: 512m
-        reservations:
-          memory: 256m
+          pids: 100
+    mem_reservation: 128m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      nproc:
+        soft: 512
+        hard: 512
+    # secrets:
+    #   - mwp_proxy_user
+    #   - mwp_proxy_pass
+    #   - mwp_geo_auth_user
+    #   - mwp_geo_auth_pass
+    #   - mwp_warp_plus_key
+
+# secrets:
+#   mwp_proxy_user:
+#     file: ./secrets/mwp_proxy_user
+#   mwp_proxy_pass:
+#     file: ./secrets/mwp_proxy_pass
+  # mwp_geo_auth_user:
+  #   file: ./secrets/mwp_geo_auth_user
+  # mwp_geo_auth_pass:
+  #   file: ./secrets/mwp_geo_auth_pass
+  # mwp_warp_plus_key:
+  #   file: ./secrets/mwp_warp_plus_key
 
 networks:
-  proxy:
+  mihomo_dev:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"

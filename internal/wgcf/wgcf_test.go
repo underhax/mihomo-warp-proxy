@@ -15,7 +15,7 @@ import (
 
 func TestParseINI(t *testing.T) {
 	profileContent := `[Interface]
-PrivateKey = YH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZEEEE=
+PrivateKey = cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address = 172.16.0.2/32,2606:4700:110:8949:fed8:548c:4603:5b00/128
 DNS = 1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001
 MTU = 1280
@@ -31,7 +31,7 @@ Endpoint = engage.cloudflareclient.com:2408
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if p.PrivateKey != "YH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZEEEE=" {
+	if p.PrivateKey != "cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" {
 		t.Errorf("PrivateKey: got %q", p.PrivateKey)
 	}
 	if p.PublicKey != "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=" {
@@ -50,7 +50,7 @@ func TestParseINICommentAndBlankLines(t *testing.T) {
 # This is a comment
 [Interface]
 # Another comment
-PrivateKey = WJ2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZDDDD=
+PrivateKey = dAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address = 172.16.0.9/32,2606:4700:110:8949:fed8:548c:4603:5b09/128
 
 [Peer]
@@ -125,7 +125,7 @@ func TestSplitAddresses(t *testing.T) {
 }
 
 func TestValidateProfile(t *testing.T) {
-	validPrivateKey := "QH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZAAAA="
+	validPrivateKey := "eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	validPublicKey := "dmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 	validIPv4 := "172.16.0.20"
 	validIPv6 := "2606:4700::20"
@@ -187,7 +187,7 @@ func TestValidateProfile(t *testing.T) {
 		{
 			name: "invalid character in key",
 			p: Profile{
-				PrivateKey: "YH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZ!!!!",
+				PrivateKey: "cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!!=",
 				PublicKey:  validPublicKey,
 				IPv4:       validIPv4,
 				IPv6:       validIPv6,
@@ -249,7 +249,7 @@ func TestParseProfileUnsafePermissions(t *testing.T) {
 	path := filepath.Join(dir, "wgcf-profile.conf")
 
 	profileContent := `[Interface]
-PrivateKey = ZH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZBBBB=
+PrivateKey = fAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address = 172.16.0.30/32,2606:4700:110:8949:fed8:548c:4603:5b30/128
 DNS = 1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001
 MTU = 1280
@@ -276,7 +276,7 @@ func TestParseProfileValid(t *testing.T) {
 	path := filepath.Join(dir, "wgcf-profile.conf")
 
 	profileContent := `[Interface]
-PrivateKey = TH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZCCCC=
+PrivateKey = gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address = 172.16.0.40/32,2606:4700:110:8949:fed8:548c:4603:5b40/128
 DNS = 1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001
 MTU = 1280
@@ -324,7 +324,7 @@ func mockExecuteWgcf(_ context.Context, _, dir string, args ...string) ([]byte, 
 	case "generate":
 		profileFile := filepath.Join(dir, "wgcf-profile.conf")
 		content := "[Interface]\n" +
-			"PrivateKey = TH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZCCCC=\n" +
+			"PrivateKey = hAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n" +
 			"Address = 172.16.0.40/32,2606:4700:110:8949:fed8:548c:4603:5b40/128\n" +
 			"DNS = 1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001\n" +
 			"MTU = 1280\n\n" +
@@ -368,7 +368,7 @@ func TestSetup(t *testing.T) {
 
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := Setup(cfg, log); err != nil {
+	if err := Setup(t.Context(), cfg, log); err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
 
@@ -380,28 +380,8 @@ func TestSetup(t *testing.T) {
 	}
 
 	cfg.Warp.Regenerate = true
-	if err := Setup(cfg, log); err != nil {
+	if err := Setup(t.Context(), cfg, log); err != nil {
 		t.Fatalf("Setup with regenerate failed: %v", err)
-	}
-}
-
-func TestEndpointHelpers(t *testing.T) {
-	cfg := &config.Config{
-		Paths: config.Paths{
-			WgcfData: "/var/lib/wgcf",
-		},
-		Warp: config.WarpConfig{
-			Endpoint: "162.159.192.1:2408",
-		},
-	}
-	if got := EndpointHost(cfg); got != "162.159.192.1" {
-		t.Errorf("got %q, want 162.159.192.1", got)
-	}
-	if got := EndpointPort(cfg); got != "2408" {
-		t.Errorf("got %q, want 2408", got)
-	}
-	if got := ProfilePath(cfg); got != "/var/lib/wgcf/wgcf-profile.conf" {
-		t.Errorf("got %q, want /var/lib/wgcf/wgcf-profile.conf", got)
 	}
 }
 
@@ -451,7 +431,7 @@ func TestSetupRegisterError(t *testing.T) {
 		},
 	}
 	log := logging.New(logging.LevelDebug, "test")
-	if err := Setup(cfg, log); err == nil {
+	if err := Setup(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when wgcf register fails, got nil")
 	} else if !strings.Contains(err.Error(), "error: network failure") {
 		t.Errorf("expected diagnostic output in error message, got: %v", err)
@@ -495,7 +475,7 @@ func TestSetupUpdateAndGenerateErrors(t *testing.T) {
 		},
 	}
 	log := logging.New(logging.LevelDebug, "test")
-	if err := Setup(cfg, log); err == nil {
+	if err := Setup(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when wgcf generate fails, got nil")
 	}
 }
@@ -607,7 +587,7 @@ PublicKey = bad
 }
 
 func TestValidateProfileEdgeCases(t *testing.T) {
-	validKey := "YH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZEEEE="
+	validKey := "iAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	p := &Profile{
 		PrivateKey: "short",
 		PublicKey:  validKey,
@@ -693,7 +673,7 @@ func TestSetupMkdirError(t *testing.T) {
 
 	cfg := &config.Config{}
 	log := logging.New(logging.LevelDebug, "test")
-	if err := Setup(cfg, log); err == nil || !strings.Contains(err.Error(), "create data directory") {
+	if err := Setup(t.Context(), cfg, log); err == nil || !strings.Contains(err.Error(), "create data directory") {
 		t.Errorf("expected create data directory error, got: %v", err)
 	}
 }
@@ -727,7 +707,7 @@ func TestSetupRemoveAccountError(t *testing.T) {
 	}
 
 	log := logging.New(logging.LevelDebug, "test")
-	if err := Setup(cfg, log); err == nil || !strings.Contains(err.Error(), "remove account file") {
+	if err := Setup(t.Context(), cfg, log); err == nil || !strings.Contains(err.Error(), "remove account file") {
 		t.Errorf("expected remove account file error, got: %v", err)
 	}
 }
@@ -761,7 +741,7 @@ func TestSetupRemoveProfileError(t *testing.T) {
 	}
 
 	log := logging.New(logging.LevelDebug, "test")
-	if err := Setup(cfg, log); err == nil || !strings.Contains(err.Error(), "remove profile file") {
+	if err := Setup(t.Context(), cfg, log); err == nil || !strings.Contains(err.Error(), "remove profile file") {
 		t.Errorf("expected remove profile file error, got: %v", err)
 	}
 }
@@ -802,7 +782,7 @@ func TestSecureFilesChmodError(t *testing.T) {
 	origExec := executeWgcf
 	defer func() { executeWgcf = origExec }()
 	executeWgcf = mockExecuteWgcf
-	if err := Setup(cfg, log); err == nil || !strings.Contains(err.Error(), "chmod") {
+	if err := Setup(t.Context(), cfg, log); err == nil || !strings.Contains(err.Error(), "chmod") {
 		t.Errorf("expected setup error from secureFiles chmod, got: %v", err)
 	}
 }
@@ -854,7 +834,7 @@ func TestParseProfileCloseAndReadErrors(t *testing.T) {
 	dir := t.TempDir()
 	profilePath := filepath.Join(dir, "profile.conf")
 	validContent := `[Interface]
-PrivateKey = YH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZEEEE=
+PrivateKey = jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address = 172.16.0.2/32,2606:4700:110:8949:fed8:548c:4603:5b00/128
 
 [Peer]

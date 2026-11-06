@@ -2,17 +2,20 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/backup"
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
-	"github.com/underhax/mihomo-warp-proxy/internal/contract"
 	"github.com/underhax/mihomo-warp-proxy/internal/geo"
+	"github.com/underhax/mihomo-warp-proxy/internal/health"
 	"github.com/underhax/mihomo-warp-proxy/internal/logging"
 	"github.com/underhax/mihomo-warp-proxy/internal/mihomo"
-	"github.com/underhax/mihomo-warp-proxy/internal/usermode"
 	"github.com/underhax/mihomo-warp-proxy/internal/warp"
 	"github.com/underhax/mihomo-warp-proxy/internal/wgcf"
 )
@@ -27,14 +30,23 @@ func defaultLoadConfig(version string) (*config.Config, error) {
 	return cfg, nil
 }
 
-func defaultRun(args []string) error {
-	return run(args)
+func defaultRun(ctx context.Context, args []string) error {
+	return run(ctx, args)
+}
+
+func defaultCheckHealth(ctx context.Context, cfg *config.Config) error {
+	if err := healthCheck(ctx, cfg); err != nil {
+		return fmt.Errorf("check health: %w", err)
+	}
+	return nil
 }
 
 var (
 	syscallExec      = syscall.Exec
 	loadConfig       = defaultLoadConfig
 	runFn            = defaultRun
+	checkHealth      = defaultCheckHealth
+	healthCheck      = health.Check
 	osExit           = os.Exit
 	prepareGeo       = geo.PrepareGeoFiles
 	wgcfSetup        = wgcf.Setup
@@ -44,54 +56,64 @@ var (
 )
 
 func main() {
-	if err := runFn(os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := runFn(ctx, os.Args[1:]); err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+			osExit(0)
+			return
+		}
 		log := logging.New(logging.LevelWarn, version)
 		log.Errorf("%v", err)
 		osExit(1)
 	}
 }
 
-func run(args []string) error {
-	reexec := len(args) > 0 && args[0] == contract.FlagRunAsUser
-
-	log := logging.New(logging.LevelWarn, version)
-
+func run(ctx context.Context, args []string) error {
 	cfg, err := loadConfig(version)
 	if err != nil {
 		return fmt.Errorf("configuration error: %w", err)
 	}
 
-	level, err := logging.ParseLevel(cfg.LogLevelStr)
-	if err != nil {
-		log.Warnf("%v — using WARN", err)
+	if len(args) > 0 && args[0] == "health" {
+		healthCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if hErr := checkHealth(healthCtx, cfg); hErr != nil {
+			return fmt.Errorf("health check failed: %w", hErr)
+		}
+		return nil
+	}
+
+	log := logging.New(logging.LevelWarn, version)
+
+	level, lErr := logging.ParseLevel(cfg.LogLevelStr)
+	if lErr != nil {
+		log.Warnf("%v — using WARN", lErr)
 		level = logging.LevelWarn
 	}
 	log = logging.New(level, version)
 
 	log.Debugf("configuration loaded: port=%d warp=%v geo=%v", cfg.ProxyPort, cfg.Warp.Enabled, cfg.Geo.Enabled)
-	log.Debugf("entrypoint starting (version %s, reexec=%v)", version, reexec)
+	log.Debugf("entrypoint starting (version %s)", version)
 
-	if err := usermode.Dispatch(cfg, reexec, log); err != nil {
-		return fmt.Errorf("usermode: %w", err)
-	}
-
-	if err := backup.ConfigFile(cfg.Paths.MihomoConfigFile); err != nil {
-		log.Warnf("config backup failed: %v", err)
+	if bErr := backup.ConfigFile(cfg.Paths.MihomoConfigFile); bErr != nil {
+		log.Warnf("config backup failed: %v", bErr)
 	} else {
 		log.Debugf("config backup created: %s.back", cfg.Paths.MihomoConfigFile)
 	}
 
-	if err := runCommonTasks(cfg, log); err != nil {
+	if err := runCommonTasks(ctx, cfg, log); err != nil {
 		return err
 	}
 
 	return execMihomo(cfg, log)
 }
 
-func runCommonTasks(cfg *config.Config, log *logging.Logger) error {
+func runCommonTasks(ctx context.Context, cfg *config.Config, log *logging.Logger) error {
 	if cfg.Geo.Enabled {
 		log.Debug("starting geo file preparation")
-		if err := prepareGeo(cfg, log); err != nil {
+		if err := prepareGeo(ctx, cfg, log); err != nil {
 			return fmt.Errorf("geo: %w", err)
 		}
 		log.Debug("geo file preparation complete")
@@ -99,7 +121,7 @@ func runCommonTasks(cfg *config.Config, log *logging.Logger) error {
 
 	if cfg.Warp.Enabled {
 		log.Debug("starting warp setup")
-		return runWarpSetup(cfg, log)
+		return runWarpSetup(ctx, cfg, log)
 	}
 
 	log.Debug("warp disabled — ensuring minimal mihomo config")
@@ -109,8 +131,8 @@ func runCommonTasks(cfg *config.Config, log *logging.Logger) error {
 	return nil
 }
 
-func runWarpSetup(cfg *config.Config, log *logging.Logger) error {
-	if err := wgcfSetup(cfg, log); err != nil {
+func runWarpSetup(ctx context.Context, cfg *config.Config, log *logging.Logger) error {
+	if err := wgcfSetup(ctx, cfg, log); err != nil {
 		return fmt.Errorf("wgcf setup: %w", err)
 	}
 	log.Debug("wgcf setup complete")

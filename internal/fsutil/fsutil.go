@@ -76,7 +76,7 @@ func createAtomicTemp(dst string, perm os.FileMode) (*os.File, string, error) {
 	return f, tmpName, nil
 }
 
-// AtomicWrite writes data to filename atomically.
+// AtomicWrite writes data to filename atomically to prevent file corruption during unexpected termination.
 func AtomicWrite(filename string, data []byte, perm os.FileMode) (retErr error) {
 	f, tmpName, err := createAtomicTemp(filename, perm)
 	if err != nil {
@@ -101,8 +101,7 @@ func AtomicWrite(filename string, data []byte, perm os.FileMode) (retErr error) 
 	return nil
 }
 
-// IsDirWritable probes write access to dir by attempting to create and
-// immediately remove a temporary file.
+// IsDirWritable verifies directory write permissions before executing mutations.
 func IsDirWritable(dir string) bool {
 	f, err := osCreateTemp(dir, ".write_probe_*.tmp")
 	if err != nil {

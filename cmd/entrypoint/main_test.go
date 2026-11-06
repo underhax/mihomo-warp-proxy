@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
@@ -16,19 +18,19 @@ func mockFetchReservedSuccess(_ string, _ *logging.Logger) ([3]byte, error) {
 	return [3]byte{1, 2, 3}, nil
 }
 
-func mockPrepareGeoDefault(_ *config.Config, _ *logging.Logger) error {
+func mockPrepareGeoDefault(_ context.Context, _ *config.Config, _ *logging.Logger) error {
 	return nil
 }
 
-func mockPrepareGeoError(_ *config.Config, _ *logging.Logger) error {
+func mockPrepareGeoError(_ context.Context, _ *config.Config, _ *logging.Logger) error {
 	return errors.New("mock prepare geo error")
 }
 
-func mockWgcfSetupSuccess(_ *config.Config, _ *logging.Logger) error {
+func mockWgcfSetupSuccess(_ context.Context, _ *config.Config, _ *logging.Logger) error {
 	return nil
 }
 
-func mockWgcfSetupFailure(_ *config.Config, _ *logging.Logger) error {
+func mockWgcfSetupFailure(_ context.Context, _ *config.Config, _ *logging.Logger) error {
 	return errors.New("mock wgcf setup failure")
 }
 
@@ -36,9 +38,22 @@ func mockWgcfParseProfileSuccess(_ *config.Config) (*wgcf.Profile, error) {
 	return &wgcf.Profile{}, nil
 }
 
+func mockFetchReservedError(_ string, _ *logging.Logger) ([3]byte, error) {
+	return [3]byte{}, errors.New("mock fetch reserved error")
+}
+
+func mockHealthCheckSuccess(_ context.Context, _ *config.Config, _ ...string) error {
+	return nil
+}
+
+func mockHealthCheckFailure(_ context.Context, _ *config.Config, _ ...string) error {
+	return errors.New("mock health check error")
+}
+
 func init() {
 	fetchReserved = mockFetchReservedSuccess
 	prepareGeo = mockPrepareGeoDefault
+	healthCheck = mockHealthCheckSuccess
 }
 
 func TestRunCommonTasksMinimal(t *testing.T) {
@@ -55,7 +70,7 @@ func TestRunCommonTasksMinimal(t *testing.T) {
 
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := runCommonTasks(cfg, log); err != nil {
+	if err := runCommonTasks(t.Context(), cfg, log); err != nil {
 		t.Fatalf("runCommonTasks failed: %v", err)
 	}
 
@@ -79,7 +94,7 @@ func TestRunCommonTasksGeoError(t *testing.T) {
 
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := runCommonTasks(cfg, log); err == nil {
+	if err := runCommonTasks(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when geo download fails, got nil")
 	}
 }
@@ -99,7 +114,7 @@ func TestRunCommonTasksWarpSetupError(t *testing.T) {
 
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := runCommonTasks(cfg, log); err == nil {
+	if err := runCommonTasks(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when warp setup fails, got nil")
 	}
 }
@@ -122,7 +137,7 @@ func TestRunWarpSetupSuccess(t *testing.T) {
 	}
 
 	profileContent := "[Interface]\n" +
-		"PrivateKey = TH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZCCCC=\n" +
+		"PrivateKey = aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n" +
 		"Address = 172.16.0.40/32,2606:4700:110:8949:fed8:548c:4603:5b40/128\n" +
 		"DNS = 1.1.1.1,1.0.0.1\n" +
 		"MTU = 1280\n\n" +
@@ -151,7 +166,7 @@ func TestRunWarpSetupSuccess(t *testing.T) {
 
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := runWarpSetup(cfg, log); err != nil {
+	if err := runWarpSetup(t.Context(), cfg, log); err != nil {
 		t.Fatalf("runWarpSetup failed: %v", err)
 	}
 
@@ -223,7 +238,7 @@ func TestMainReexecSuccess(t *testing.T) {
 	})
 
 	origArgs := os.Args
-	os.Args = []string{"entrypoint", contract.FlagRunAsUser}
+	os.Args = []string{"entrypoint"}
 	t.Cleanup(func() {
 		os.Args = origArgs
 	})
@@ -264,7 +279,7 @@ func TestMainInvalidLogLevel(t *testing.T) {
 	})
 
 	origArgs := os.Args
-	os.Args = []string{"entrypoint", contract.FlagRunAsUser}
+	os.Args = []string{"entrypoint"}
 	t.Cleanup(func() {
 		os.Args = origArgs
 	})
@@ -285,6 +300,9 @@ func TestDefaultLoadConfig(t *testing.T) {
 	}
 	if cfg == nil || cfg.Version != "test-version" {
 		t.Errorf("unexpected config result: %v", cfg)
+	}
+	if cfg.ProxyPass != "Ab1cdefghijklmnopqrstuvwxyz0123456789" {
+		t.Errorf("ProxyPass mismatch: got %q", cfg.ProxyPass)
 	}
 }
 
@@ -320,7 +338,7 @@ func TestRunWarpSetupParseProfileError(t *testing.T) {
 	})
 
 	log := logging.New(logging.LevelDebug, "test")
-	if err := runWarpSetup(cfg, log); err == nil {
+	if err := runWarpSetup(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when profile parsing fails, got nil")
 	}
 }
@@ -330,7 +348,7 @@ func TestMainSuccess(t *testing.T) {
 	origExit := osExit
 	var ran bool
 	var exited bool
-	runFn = func(_ []string) error {
+	runFn = func(_ context.Context, _ []string) error {
 		ran = true
 		return nil
 	}
@@ -356,7 +374,7 @@ func TestMainError(t *testing.T) {
 	origRun := runFn
 	origExit := osExit
 	var exitCode int
-	runFn = func(_ []string) error {
+	runFn = func(_ context.Context, _ []string) error {
 		return errors.New("test error")
 	}
 	osExit = func(code int) {
@@ -374,6 +392,33 @@ func TestMainError(t *testing.T) {
 	}
 }
 
+func TestMainCanceled(t *testing.T) {
+	origRun := runFn
+	origExit := osExit
+	var exitCode int
+	var exited bool
+	runFn = func(_ context.Context, _ []string) error {
+		return context.Canceled
+	}
+	osExit = func(code int) {
+		exitCode = code
+		exited = true
+	}
+	t.Cleanup(func() {
+		runFn = origRun
+		osExit = origExit
+	})
+
+	main()
+
+	if !exited {
+		t.Error("expected osExit to be called on context.Canceled")
+	}
+	if exitCode != 0 {
+		t.Errorf("expected exit code 0 on context.Canceled, got %d", exitCode)
+	}
+}
+
 func TestRunLoadConfigError(t *testing.T) {
 	origLoad := loadConfig
 	loadConfig = func(_ string) (*config.Config, error) {
@@ -383,32 +428,101 @@ func TestRunLoadConfigError(t *testing.T) {
 		loadConfig = origLoad
 	})
 
-	err := run(nil)
+	err := run(t.Context(), nil)
 	if err == nil {
 		t.Error("expected error from run on config failure, got nil")
 	}
 }
 
-func TestRunUsermodeError(t *testing.T) {
+func TestRunHealth(t *testing.T) {
 	origLoad := loadConfig
-	loadConfig = func(_ string) (*config.Config, error) {
-		return &config.Config{
-			LogLevelStr:   contract.LogLevelDebug,
-			MultiUserMode: true,
-			Paths: config.Paths{
-				MihomoData: "/nonexistent/path/for/test/usermode/mihomo",
-				WgcfData:   "/nonexistent/path/for/test/usermode/wgcf",
-			},
-		}, nil
-	}
+	origHealth := checkHealth
 	t.Cleanup(func() {
 		loadConfig = origLoad
+		checkHealth = origHealth
 	})
 
-	err := run(nil)
-	if err == nil {
-		t.Error("expected usermode error, got nil")
+	tests := []struct {
+		name       string
+		loadFn     func(string) (*config.Config, error)
+		healthFn   func(context.Context, *config.Config) error
+		wantErrSub string
+	}{
+		{
+			name: "success",
+			loadFn: func(_ string) (*config.Config, error) {
+				return &config.Config{ProxyPort: 7890}, nil
+			},
+			healthFn: func(_ context.Context, _ *config.Config) error {
+				return nil
+			},
+			wantErrSub: "",
+		},
+		{
+			name: "health check failure",
+			loadFn: func(_ string) (*config.Config, error) {
+				return &config.Config{ProxyPort: 7890}, nil
+			},
+			healthFn: func(_ context.Context, _ *config.Config) error {
+				return errors.New("simulated probe failure")
+			},
+			wantErrSub: "health check failed",
+		},
+		{
+			name: "config load failure",
+			loadFn: func(_ string) (*config.Config, error) {
+				return nil, errors.New("simulated config load error")
+			},
+			healthFn: func(_ context.Context, _ *config.Config) error {
+				return nil
+			},
+			wantErrSub: "configuration error",
+		},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loadConfig = tt.loadFn
+			checkHealth = tt.healthFn
+			err := run(t.Context(), []string{"health"})
+			if tt.wantErrSub == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErrSub, err)
+			}
+		})
+	}
+}
+
+func TestDefaultCheckHealth(t *testing.T) {
+	origHealthCheck := healthCheck
+	t.Cleanup(func() {
+		healthCheck = origHealthCheck
+	})
+
+	t.Run("success returns nil", func(t *testing.T) {
+		healthCheck = mockHealthCheckSuccess
+		cfg := &config.Config{ProxyPort: 7890}
+		if err := defaultCheckHealth(t.Context(), cfg); err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+	})
+
+	t.Run("failure wraps error", func(t *testing.T) {
+		healthCheck = mockHealthCheckFailure
+		cfg := &config.Config{ProxyPort: 7890}
+		err := defaultCheckHealth(t.Context(), cfg)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "check health: mock health check error") {
+			t.Errorf("expected wrapped error, got: %v", err)
+		}
+	})
 }
 
 func TestRunCommonTasksError(t *testing.T) {
@@ -433,7 +547,7 @@ func TestRunCommonTasksError(t *testing.T) {
 		prepareGeo = origGeo
 	})
 
-	err := run([]string{contract.FlagRunAsUser})
+	err := run(t.Context(), nil)
 	if err == nil {
 		t.Error("expected runCommonTasks error, got nil")
 	}
@@ -464,7 +578,7 @@ func TestRunExecMihomoError(t *testing.T) {
 		loadConfig = origLoad
 	})
 
-	err := run([]string{contract.FlagRunAsUser})
+	err := run(t.Context(), nil)
 	if err == nil {
 		t.Error("expected execMihomo error, got nil")
 	}
@@ -498,7 +612,7 @@ func TestRunBackupSuccess(t *testing.T) {
 		loadConfig = origLoad
 	})
 
-	if err := run([]string{contract.FlagRunAsUser}); err != nil {
+	if err := run(t.Context(), nil); err != nil {
 		t.Fatalf("unexpected error with backup: %v", err)
 	}
 	if _, err := os.Stat(configFile + ".back"); err != nil {
@@ -529,7 +643,7 @@ func TestRunBackupFailure(t *testing.T) {
 		loadConfig = origLoad
 	})
 
-	if err := run([]string{contract.FlagRunAsUser}); err == nil {
+	if err := run(t.Context(), nil); err == nil {
 		t.Error("expected error for forbidden config path, got nil")
 	}
 }
@@ -543,7 +657,7 @@ func TestDefaultRun(t *testing.T) {
 		loadConfig = origLoad
 	})
 
-	err := defaultRun(nil)
+	err := defaultRun(t.Context(), nil)
 	if err == nil {
 		t.Error("expected error from defaultRun, got nil")
 	}
@@ -563,7 +677,7 @@ func TestRunWarpSetupEnsureConfigError(t *testing.T) {
 		t.Fatal(err)
 	}
 	profileContent := "[Interface]\n" +
-		"PrivateKey = TH2h2kSHzMaAgBNiNWuMEljlKGsaVKnv+hFtZOZCCCC=\n" +
+		"PrivateKey = aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n" +
 		"Address = 172.16.0.40/32,2606:4700:110:8949:fed8:548c:4603:5b40/128\n" +
 		"DNS = 1.1.1.1,1.0.0.1\n" +
 		"MTU = 1280\n\n" +
@@ -586,7 +700,7 @@ func TestRunWarpSetupEnsureConfigError(t *testing.T) {
 		},
 	}
 	log := logging.New(logging.LevelDebug, "test")
-	if err := runWarpSetup(cfg, log); err == nil {
+	if err := runWarpSetup(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when EnsureConfig fails in runWarpSetup, got nil")
 	}
 }
@@ -598,14 +712,14 @@ func TestRunCommonTasksEnsureConfigError(t *testing.T) {
 		},
 	}
 	log := logging.New(logging.LevelDebug, "test")
-	if err := runCommonTasks(cfg, log); err == nil {
+	if err := runCommonTasks(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when EnsureConfig fails with warp disabled, got nil")
 	}
 }
 
 var testGeoCalled bool
 
-func mockPrepareGeoFlag(_ *config.Config, _ *logging.Logger) error {
+func mockPrepareGeoFlag(_ context.Context, _ *config.Config, _ *logging.Logger) error {
 	testGeoCalled = true
 	return nil
 }
@@ -636,7 +750,7 @@ func TestRunCommonTasksGeoSuccess(t *testing.T) {
 	}
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := runCommonTasks(cfg, log); err != nil {
+	if err := runCommonTasks(t.Context(), cfg, log); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !testGeoCalled {
@@ -675,11 +789,43 @@ func TestRunWarpSetupReservedSuccess(t *testing.T) {
 	}
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := runWarpSetup(cfg, log); err != nil {
+	if err := runWarpSetup(t.Context(), cfg, log); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if testCapturedReserved != [3]byte{1, 2, 3} {
 		t.Errorf("expected reserved [1, 2, 3], got %v", testCapturedReserved)
+	}
+}
+
+func TestRunWarpSetupFetchReservedError(t *testing.T) {
+	origSetup := wgcfSetup
+	origParse := wgcfParseProfile
+	origReserved := fetchReserved
+	origEnsure := ensureConfig
+	t.Cleanup(func() {
+		wgcfSetup = origSetup
+		wgcfParseProfile = origParse
+		fetchReserved = origReserved
+		ensureConfig = origEnsure
+	})
+
+	wgcfSetup = mockWgcfSetupSuccess
+	wgcfParseProfile = mockWgcfParseProfileSuccess
+	fetchReserved = mockFetchReservedError
+	ensureConfig = mockEnsureConfigCapture
+
+	cfg := &config.Config{
+		Paths: config.Paths{
+			WgcfAccountFile: "/dummy/account.toml",
+		},
+	}
+	log := logging.New(logging.LevelDebug, "test")
+
+	if err := runWarpSetup(t.Context(), cfg, log); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if testCapturedReserved != [3]byte{} {
+		t.Errorf("expected empty reserved bytes on error, got %v", testCapturedReserved)
 	}
 }
 
@@ -691,7 +837,7 @@ func TestRunWarpSetupWgcfSetupError(t *testing.T) {
 	})
 	cfg := &config.Config{}
 	log := logging.New(logging.LevelDebug, "test")
-	if err := runWarpSetup(cfg, log); err == nil {
+	if err := runWarpSetup(t.Context(), cfg, log); err == nil {
 		t.Error("expected error when wgcfSetup fails, got nil")
 	}
 }

@@ -1,7 +1,5 @@
 // Package config loads and validates all runtime configuration from environment
-// variables. It is the single source of truth for variable names, defaults, and
-// acceptable value ranges. All other packages receive a *Config — they never
-// read os.Getenv directly.
+// variables and Docker secrets to enforce consistent parameters across packages.
 package config
 
 import (
@@ -9,18 +7,18 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/contract"
 	"github.com/underhax/mihomo-warp-proxy/internal/validate"
 )
 
-// Paths groups filesystem locations that are fixed by the image layout.
-// They are not user-configurable but are centralised here so every package
-// references the same constants rather than scattering string literals.
+const defaultSecretsDir = "/run/secrets"
+
+// Paths groups binary and data locations to enforce a deterministic filesystem layout.
 type Paths struct {
 	MihomoData       string
 	MihomoConfigFile string
@@ -29,11 +27,9 @@ type Paths struct {
 	WgcfProfileFile  string
 	MihomoBin        string
 	WgcfBin          string
-	SuExecBin        string
-	VersionFile      string
 }
 
-// GeoURLs holds the four geodata download endpoints.
+// GeoURLs holds upstream download endpoints for geodata routing databases.
 type GeoURLs struct {
 	GeoIP   string
 	GeoSite string
@@ -41,7 +37,7 @@ type GeoURLs struct {
 	ASN     string
 }
 
-// GeoConfig controls geodata download behaviour.
+// GeoConfig controls geodata download, authentication, and update behaviour.
 type GeoConfig struct {
 	URLs       GeoURLs
 	AuthUser   string
@@ -51,9 +47,7 @@ type GeoConfig struct {
 	AutoUpdate bool
 }
 
-// AmneziaConfig holds AmneziaWG obfuscation parameters.
-// JMin and JMax are only meaningful when Enabled is true; the validator
-// enforces 0 <= JMin < JMax <= 1280 as required by the AmneziaWG spec.
+// AmneziaConfig holds AmneziaWG obfuscation parameters to mitigate DPI packet inspection.
 type AmneziaConfig struct {
 	I       [5]string
 	JC      int
@@ -62,7 +56,7 @@ type AmneziaConfig struct {
 	Enabled bool
 }
 
-// WarpConfig controls Cloudflare WARP provisioning via wgcf.
+// WarpConfig controls Cloudflare WARP tunnel provisioning and WireGuard parameters.
 type WarpConfig struct {
 	DNS        []string
 	PlusKey    string
@@ -72,11 +66,9 @@ type WarpConfig struct {
 	Regenerate bool
 }
 
-// Config is the fully parsed and validated runtime configuration.
-// Zero values are never meaningful — always obtain via Load().
+// Config represents fully validated runtime settings required to operate the proxy safely.
 type Config struct {
 	Paths         Paths
-	TZ            string
 	LogLevelStr   string
 	ProxyLogLevel string
 	ProxyUser     string
@@ -84,10 +76,7 @@ type Config struct {
 	Version       string
 	Geo           GeoConfig
 	Warp          WarpConfig
-	ProxyUID      uint32
-	ProxyGID      uint32
 	ProxyPort     uint16
-	MultiUserMode bool
 	UseIP6        bool
 }
 
@@ -100,255 +89,34 @@ func defaultGetPaths() Paths {
 		WgcfProfileFile:  "/app/wgcf/wgcf-profile.conf",
 		MihomoBin:        "/usr/local/bin/mihomo",
 		WgcfBin:          "/usr/local/bin/wgcf",
-		SuExecBin:        "/sbin/su-exec",
-		VersionFile:      "/app/version",
 	}
 }
 
 var getPaths = defaultGetPaths
 
-// Load reads all environment variables, applies defaults, and validates values.
-// It returns a fully populated Config or an error describing the first
-// validation failure. It never calls os.Exit.
-func Load(version string) (*Config, error) {
-	cfg := &Config{
-		Paths:   getPaths(),
-		Version: version,
-	}
-
-	if err := validatePaths(&cfg.Paths); err != nil {
-		return nil, err
-	}
-
-	cfg.TZ = getEnv(contract.EnvTZ, "UTC")
-	if err := validateTZ(cfg.TZ); err != nil {
-		return nil, err
-	}
-
-	cfg.LogLevelStr = getEnv(contract.EnvScriptLogLevel, contract.LogLevelWarn)
-	if err := validateScriptLogLevel(cfg.LogLevelStr); err != nil {
-		return nil, err
-	}
-	cfg.LogLevelStr = strings.ToUpper(strings.TrimSpace(cfg.LogLevelStr))
-
-	cfg.ProxyLogLevel = getEnv(contract.EnvProxyLogLevel, "info")
-	if err := validateProxyLogLevel(cfg.ProxyLogLevel); err != nil {
-		return nil, err
-	}
-	cfg.ProxyLogLevel = strings.ToLower(strings.TrimSpace(cfg.ProxyLogLevel))
-
-	uid, err := parseUint32Env(contract.EnvProxyUID, "911", 1, 65535)
-	if err != nil {
-		return nil, err
-	}
-	cfg.ProxyUID = uid
-
-	gid, err := parseUint32Env(contract.EnvProxyGID, "911", 1, 65535)
-	if err != nil {
-		return nil, err
-	}
-	cfg.ProxyGID = gid
-
-	port, err := parseUint16Env(contract.EnvProxyPort, "7890", 1, 65535)
-	if err != nil {
-		return nil, err
-	}
-	cfg.ProxyPort = port
-
-	cfg.ProxyUser = getEnv(contract.EnvProxyUser, "")
-	cfg.ProxyPass = getEnv(contract.EnvProxyPass, "")
-	err = validateCredentialPair(cfg.ProxyUser, cfg.ProxyPass)
-	if err != nil {
-		return nil, err
-	}
-
-	multiUser, err := parseBoolEnv(contract.EnvMultiUserMode, true)
-	if err != nil {
-		return nil, err
-	}
-	cfg.MultiUserMode = multiUser
-
-	useIP6, err := parseBoolEnv(contract.EnvUseIP6, true)
-	if err != nil {
-		return nil, err
-	}
-	cfg.UseIP6 = useIP6
-
-	geo, err := loadGeoConfig()
-	if err != nil {
-		return nil, err
-	}
-	cfg.Geo = geo
-
-	warp, err := loadWarpConfig()
-	if err != nil {
-		return nil, err
-	}
-	cfg.Warp = warp
-
-	return cfg, nil
+type envResolver struct {
+	secrets map[string]string
 }
 
-func loadGeoConfig() (GeoConfig, error) {
-	var (
-		g   GeoConfig
-		err error
-	)
-
-	g.Enabled, err = parseBoolEnv(contract.EnvGeo, false)
-	if err != nil {
-		return g, err
+func (r *envResolver) get(key, def string) string {
+	if val, ok := r.secrets[key]; ok {
+		return val
 	}
-
-	g.Redownload, err = parseBoolEnv(contract.EnvGeoRedownload, false)
-	if err != nil {
-		return g, err
-	}
-
-	g.AutoUpdate, err = parseBoolEnv(contract.EnvGeoAutoUpdate, false)
-	if err != nil {
-		return g, err
-	}
-
-	g.URLs = GeoURLs{
-		GeoIP:   getEnv(contract.EnvGeoURLGeoIP, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"),
-		GeoSite: getEnv(contract.EnvGeoURLGeoSite, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"),
-		MMDB:    getEnv(contract.EnvGeoURLMMDB, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"),
-		ASN:     getEnv(contract.EnvGeoURLASN, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"),
-	}
-
-	for name, u := range map[string]string{
-		contract.EnvGeoURLGeoIP:   g.URLs.GeoIP,
-		contract.EnvGeoURLGeoSite: g.URLs.GeoSite,
-		contract.EnvGeoURLMMDB:    g.URLs.MMDB,
-		contract.EnvGeoURLASN:     g.URLs.ASN,
-	} {
-		if err := validateGeoURL(name, u); err != nil {
-			return g, err
-		}
-	}
-
-	g.AuthUser = getEnv(contract.EnvGeoAuthUser, "")
-	g.AuthPass = getEnv(contract.EnvGeoAuthSecret, "")
-
-	if (g.AuthUser == "") != (g.AuthPass == "") {
-		return g, errors.New(contract.EnvGeoAuthUser + " and " + contract.EnvGeoAuthSecret + " must both be set or both be empty")
-	}
-
-	if g.AuthUser != "" {
-		if err := validateGeoCredential(contract.EnvGeoAuthUser, g.AuthUser); err != nil {
-			return g, err
-		}
-		if err := validateGeoCredential(contract.EnvGeoAuthSecret, g.AuthPass); err != nil {
-			return g, err
-		}
-	}
-
-	return g, nil
-}
-
-func loadWarpConfig() (WarpConfig, error) {
-	var w WarpConfig
-
-	enabled, err := parseBoolEnv(contract.EnvUseWarpConfig, true)
-	if err != nil {
-		return w, err
-	}
-	w.Enabled = enabled
-
-	regenerate, err := parseBoolEnv(contract.EnvWarpRegenerate, false)
-	if err != nil {
-		return w, err
-	}
-	w.Regenerate = regenerate
-
-	w.PlusKey = getEnv(contract.EnvWarpPlusKey, "")
-	if w.PlusKey != "" {
-		err = validateWarpPlusKey(w.PlusKey)
-		if err != nil {
-			return w, err
-		}
-	}
-
-	w.Endpoint = getEnv(contract.EnvWarpEndpoint, "engage.cloudflareclient.com:500")
-	err = validateWarpEndpoint(w.Endpoint)
-	if err != nil {
-		return w, err
-	}
-
-	dns, err := parseDNSList(getEnv(contract.EnvWarpDNS, "1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001"))
-	if err != nil {
-		return w, err
-	}
-	w.DNS = dns
-
-	amnezia, err := loadAmneziaConfig()
-	if err != nil {
-		return w, err
-	}
-	w.Amnezia = amnezia
-
-	return w, nil
-}
-
-func loadAmneziaConfig() (AmneziaConfig, error) {
-	var (
-		a   AmneziaConfig
-		err error
-	)
-
-	a.Enabled, err = parseBoolEnv(contract.EnvWarpAmnezia, false)
-	if err != nil {
-		return a, err
-	}
-
-	if !a.Enabled {
-		return a, nil
-	}
-
-	a.JC, err = parseIntEnv(contract.EnvWarpAmneziaJC, "0", 0, 128)
-	if err != nil {
-		return a, err
-	}
-
-	a.JMin, err = parseIntEnv(contract.EnvWarpAmneziaJMin, "0", 0, 1280)
-	if err != nil {
-		return a, err
-	}
-
-	a.JMax, err = parseIntEnv(contract.EnvWarpAmneziaJMax, "0", 0, 1280)
-	if err != nil {
-		return a, err
-	}
-
-	if a.JMin >= a.JMax {
-		return a, fmt.Errorf("%s (%d) must be less than %s (%d)", contract.EnvWarpAmneziaJMin, a.JMin, contract.EnvWarpAmneziaJMax, a.JMax)
-	}
-
-	for i := range a.I {
-		name := fmt.Sprintf("%s%d", contract.EnvWarpAmneziaIPrefix, i+1)
-		a.I[i] = getEnv(name, "")
-	}
-
-	for i, val := range a.I {
-		name := fmt.Sprintf("%s%d", contract.EnvWarpAmneziaIPrefix, i+1)
-		if err := validate.AmneziaIParam(name, val); err != nil {
-			return a, fmt.Errorf("%s: %w", name, err)
-		}
-	}
-
-	return a, nil
-}
-
-func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
 }
 
-func parseBoolEnv(key string, def bool) (bool, error) {
-	raw, ok := os.LookupEnv(key)
+func (r *envResolver) lookup(key string) (string, bool) {
+	if val, ok := r.secrets[key]; ok {
+		return val, true
+	}
+	return os.LookupEnv(key)
+}
+
+func (r *envResolver) parseBool(key string, def bool) (bool, error) {
+	raw, ok := r.lookup(key)
 	if !ok || raw == "" {
 		return def, nil
 	}
@@ -363,28 +131,8 @@ func parseBoolEnv(key string, def bool) (bool, error) {
 	return false, fmt.Errorf("%s: invalid boolean value %q (accepted: true/false/1/0/yes/no/on/off)", key, raw)
 }
 
-func isTrueBoolEnvValue(v string) bool {
-	return v == "true" || v == "1" || v == "yes" || v == "on"
-}
-
-func isFalseBoolEnvValue(v string) bool {
-	return v == "false" || v == "0" || v == "no" || v == "off"
-}
-
-func parseUint32Env(key, def string, minVal, maxVal uint32) (uint32, error) {
-	raw := getEnv(key, def)
-	v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%s: invalid integer value %q", key, raw)
-	}
-	if v > math.MaxUint32 || v < uint64(minVal) || v > uint64(maxVal) {
-		return 0, fmt.Errorf("%s: value %d out of range [%d, %d]", key, v, minVal, maxVal)
-	}
-	return uint32(v), nil
-}
-
-func parseUint16Env(key, def string, minVal, maxVal uint16) (uint16, error) {
-	raw := getEnv(key, def)
+func (r *envResolver) parseUint16(key, def string, minVal, maxVal uint16) (uint16, error) {
+	raw := r.get(key, def)
 	v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s: invalid integer value %q", key, raw)
@@ -395,8 +143,8 @@ func parseUint16Env(key, def string, minVal, maxVal uint16) (uint16, error) {
 	return uint16(v), nil
 }
 
-func parseIntEnv(key, def string, minVal, maxVal int) (int, error) {
-	raw := getEnv(key, def)
+func (r *envResolver) parseInt(key, def string, minVal, maxVal int) (int, error) {
+	raw := r.get(key, def)
 	v, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil {
 		return 0, fmt.Errorf("%s: invalid integer value %q", key, raw)
@@ -405,6 +153,302 @@ func parseIntEnv(key, def string, minVal, maxVal int) (int, error) {
 		return 0, fmt.Errorf("%s: value %d out of range [%d, %d]", key, v, minVal, maxVal)
 	}
 	return v, nil
+}
+
+func defaultReadSecret(dir, filename string) (string, error) {
+	const maxSecretSize = 4096
+
+	path := filepath.Clean(filepath.Join(dir, filename))
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("invalid secret path: %s", path)
+	}
+
+	info, err := osStat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat secret %q: %w", filename, err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("secret %q is not a regular file", filename)
+	}
+
+	if info.Size() > maxSecretSize {
+		return "", fmt.Errorf("secret %q exceeds %d bytes", filename, maxSecretSize)
+	}
+
+	data, err := osReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read secret %q: %w", filename, err)
+	}
+
+	secret := strings.TrimSpace(string(data))
+	if secret == "" {
+		return "", fmt.Errorf("secret %q is empty", filename)
+	}
+
+	return secret, nil
+}
+
+func defaultLoadSecrets(dir string) (map[string]string, error) {
+	entries, err := osReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[string]string), nil
+		}
+		return nil, fmt.Errorf("read secrets directory: %w", err)
+	}
+
+	secrets := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		lowerName := strings.ToLower(name)
+		if !strings.HasPrefix(lowerName, "mwp_") {
+			continue
+		}
+
+		key := strings.ToUpper(strings.TrimPrefix(lowerName, "mwp_"))
+		if key == "" {
+			continue
+		}
+
+		val, err := readSecret(dir, name)
+		if err != nil {
+			return nil, err
+		}
+		secrets[key] = val
+	}
+	return secrets, nil
+}
+
+var (
+	secretsDir  = defaultSecretsDir
+	readSecret  = defaultReadSecret
+	loadSecrets = defaultLoadSecrets
+	osStat      = os.Stat
+	osReadFile  = os.ReadFile
+	osReadDir   = os.ReadDir
+)
+
+// Load parses environment variables and Docker secrets, validating boundaries to ensure safe service execution.
+func Load(version string) (*Config, error) {
+	secrets, err := loadSecrets(secretsDir)
+	if err != nil {
+		return nil, fmt.Errorf("load secrets: %w", err)
+	}
+
+	r := &envResolver{secrets: secrets}
+
+	cfg := &Config{
+		Paths:   getPaths(),
+		Version: version,
+	}
+
+	if valErr := validatePaths(&cfg.Paths); valErr != nil {
+		return nil, valErr
+	}
+
+	cfg.LogLevelStr = r.get(contract.EnvScriptLogLevel, contract.LogLevelWarn)
+	if valErr := validateScriptLogLevel(cfg.LogLevelStr); valErr != nil {
+		return nil, valErr
+	}
+	cfg.LogLevelStr = strings.ToUpper(strings.TrimSpace(cfg.LogLevelStr))
+
+	cfg.ProxyLogLevel = r.get(contract.EnvProxyLogLevel, "info")
+	if valErr := validateProxyLogLevel(cfg.ProxyLogLevel); valErr != nil {
+		return nil, valErr
+	}
+	cfg.ProxyLogLevel = strings.ToLower(strings.TrimSpace(cfg.ProxyLogLevel))
+
+	port, err := r.parseUint16(contract.EnvProxyPort, "7890", 1, 65535)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ProxyPort = port
+
+	cfg.ProxyUser = r.get(contract.EnvProxyUser, "")
+	cfg.ProxyPass = r.get(contract.EnvProxyPass, "")
+	if valErr := validateCredentialPair(cfg.ProxyUser, cfg.ProxyPass); valErr != nil {
+		return nil, valErr
+	}
+
+	useIP6, err := r.parseBool(contract.EnvUseIP6, true)
+	if err != nil {
+		return nil, err
+	}
+	cfg.UseIP6 = useIP6
+
+	geo, err := loadGeoConfig(r)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Geo = geo
+
+	warp, err := loadWarpConfig(r)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warp = warp
+
+	return cfg, nil
+}
+
+func loadGeoConfig(r *envResolver) (GeoConfig, error) {
+	var (
+		g   GeoConfig
+		err error
+	)
+
+	g.Enabled, err = r.parseBool(contract.EnvGeo, false)
+	if err != nil {
+		return g, err
+	}
+
+	g.Redownload, err = r.parseBool(contract.EnvGeoRedownload, false)
+	if err != nil {
+		return g, err
+	}
+
+	g.AutoUpdate, err = r.parseBool(contract.EnvGeoAutoUpdate, false)
+	if err != nil {
+		return g, err
+	}
+
+	g.URLs = GeoURLs{
+		GeoIP:   r.get(contract.EnvGeoURLGeoIP, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"),
+		GeoSite: r.get(contract.EnvGeoURLGeoSite, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"),
+		MMDB:    r.get(contract.EnvGeoURLMMDB, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"),
+		ASN:     r.get(contract.EnvGeoURLASN, "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"),
+	}
+
+	for name, u := range map[string]string{
+		contract.EnvGeoURLGeoIP:   g.URLs.GeoIP,
+		contract.EnvGeoURLGeoSite: g.URLs.GeoSite,
+		contract.EnvGeoURLMMDB:    g.URLs.MMDB,
+		contract.EnvGeoURLASN:     g.URLs.ASN,
+	} {
+		if valErr := validateGeoURL(name, u); valErr != nil {
+			return g, valErr
+		}
+	}
+
+	g.AuthUser = r.get(contract.EnvGeoAuthUser, "")
+	g.AuthPass = r.get(contract.EnvGeoAuth, "")
+
+	if (g.AuthUser == "") != (g.AuthPass == "") {
+		return g, errors.New(contract.EnvGeoAuthUser + " and " + contract.EnvGeoAuth + " must both be set or both be empty")
+	}
+
+	if g.AuthUser != "" {
+		if err := validateGeoCredential(contract.EnvGeoAuthUser, g.AuthUser); err != nil {
+			return g, err
+		}
+		if err := validateGeoCredential(contract.EnvGeoAuth, g.AuthPass); err != nil {
+			return g, err
+		}
+	}
+
+	return g, nil
+}
+
+func loadWarpConfig(r *envResolver) (WarpConfig, error) {
+	var (
+		w   WarpConfig
+		err error
+	)
+
+	w.Enabled, err = r.parseBool(contract.EnvUseWarpConfig, true)
+	if err != nil {
+		return w, err
+	}
+
+	w.Regenerate, err = r.parseBool(contract.EnvWarpRegenerate, false)
+	if err != nil {
+		return w, err
+	}
+
+	w.PlusKey = r.get(contract.EnvWarpPlusKey, "")
+	if w.PlusKey != "" {
+		if valErr := validateWarpPlusKey(w.PlusKey); valErr != nil {
+			return w, valErr
+		}
+	}
+
+	w.Endpoint = r.get(contract.EnvWarpEndpoint, "engage.cloudflareclient.com:500")
+	if valErr := validateWarpEndpoint(w.Endpoint); valErr != nil {
+		return w, valErr
+	}
+
+	dns, err := parseDNSList(r.get(contract.EnvWarpDNS, "1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001"))
+	if err != nil {
+		return w, err
+	}
+	w.DNS = dns
+
+	amnezia, err := loadAmneziaConfig(r)
+	if err != nil {
+		return w, err
+	}
+	w.Amnezia = amnezia
+
+	return w, nil
+}
+
+func loadAmneziaConfig(r *envResolver) (AmneziaConfig, error) {
+	var (
+		a   AmneziaConfig
+		err error
+	)
+
+	a.Enabled, err = r.parseBool(contract.EnvWarpAmnezia, false)
+	if err != nil {
+		return a, err
+	}
+
+	if !a.Enabled {
+		return a, nil
+	}
+
+	a.JC, err = r.parseInt(contract.EnvWarpAmneziaJC, "0", 0, 128)
+	if err != nil {
+		return a, err
+	}
+
+	a.JMin, err = r.parseInt(contract.EnvWarpAmneziaJMin, "0", 0, 1280)
+	if err != nil {
+		return a, err
+	}
+
+	a.JMax, err = r.parseInt(contract.EnvWarpAmneziaJMax, "0", 0, 1280)
+	if err != nil {
+		return a, err
+	}
+
+	if a.JMin >= a.JMax {
+		return a, fmt.Errorf("%s (%d) must be less than %s (%d)", contract.EnvWarpAmneziaJMin, a.JMin, contract.EnvWarpAmneziaJMax, a.JMax)
+	}
+
+	for i := range a.I {
+		name := fmt.Sprintf("%s%d", contract.EnvWarpAmneziaIPrefix, i+1)
+		a.I[i] = r.get(name, "")
+	}
+
+	for i, val := range a.I {
+		name := fmt.Sprintf("%s%d", contract.EnvWarpAmneziaIPrefix, i+1)
+		if err := validate.AmneziaIParam(name, val); err != nil {
+			return a, fmt.Errorf("%s: %w", name, err)
+		}
+	}
+
+	return a, nil
+}
+
+func isTrueBoolEnvValue(v string) bool {
+	return v == "true" || v == "1" || v == "yes" || v == "on"
+}
+
+func isFalseBoolEnvValue(v string) bool {
+	return v == "false" || v == "0" || v == "no" || v == "off"
 }
 
 func validateScriptLogLevel(v string) error {
@@ -437,8 +481,7 @@ func validateCredentialPair(user, pass string) error {
 	passSet := pass != ""
 
 	if !userSet && !passSet {
-		return errors.New(contract.EnvProxyUser + " and " + contract.EnvProxyPass + " are required — an open unauthenticated proxy is a security risk; " +
-			"generate credentials with: pwgen -s 64 1 && pwgen -s 128 1")
+		return nil
 	}
 	if userSet && !passSet {
 		return errors.New(contract.EnvProxyPass + " must be set when " + contract.EnvProxyUser + " is provided")
@@ -629,13 +672,6 @@ func isIPv4(s string) bool {
 	return true
 }
 
-func validateTZ(tz string) error {
-	if _, err := time.LoadLocation(tz); err != nil {
-		return fmt.Errorf("%s: invalid timezone %q: %w", contract.EnvTZ, tz, err)
-	}
-	return nil
-}
-
 var warpPlusKeyRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{8}$`)
 
 func validateWarpPlusKey(key string) error {
@@ -660,10 +696,10 @@ func validateGeoCredential(name, value string) error {
 		switch {
 		case r == ':' || r == '@':
 			return fmt.Errorf("%s: character %q not allowed (position %d)", name, r, i)
-		case r < 0x20 || r == 0x7f:
-			return fmt.Errorf("%s: control character not allowed (position %d)", name, i)
 		case r == 0x00:
 			return fmt.Errorf("%s: null byte not allowed (position %d)", name, i)
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("%s: control character not allowed (position %d)", name, i)
 		case r == ' ':
 			return fmt.Errorf("%s: whitespace not allowed (position %d)", name, i)
 		}
@@ -671,15 +707,14 @@ func validateGeoCredential(name, value string) error {
 	return nil
 }
 
-// FilterEnviron removes sensitive credentials from the environment slice
-// before passing it to subprocesses (wgcf, mihomo). This prevents credential
-// leakage through process listing or accidental logging by child processes.
+// FilterEnviron scrubs sensitive authentication credentials from environment variables
+// to prevent credential leakage to child processes or diagnostic logs.
 func FilterEnviron(environ []string) []string {
 	clean := make([]string, 0, len(environ))
 	for _, e := range environ {
 		if key, _, ok := strings.Cut(e, "="); ok {
 			switch key {
-			case contract.EnvProxyPass, contract.EnvGeoAuthUser, contract.EnvGeoAuthSecret, contract.EnvWarpPlusKey:
+			case contract.EnvProxyPass, contract.EnvGeoAuthUser, contract.EnvGeoAuth, contract.EnvWarpPlusKey:
 				continue
 			}
 		}
@@ -700,8 +735,6 @@ func validatePaths(p *Paths) error {
 		{"WgcfProfileFile", p.WgcfProfileFile},
 		{"MihomoBin", p.MihomoBin},
 		{"WgcfBin", p.WgcfBin},
-		{"SuExecBin", p.SuExecBin},
-		{"VersionFile", p.VersionFile},
 	}
 	for _, target := range paths {
 		if err := validate.Path(target.path, target.name); err != nil {

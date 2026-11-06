@@ -1,5 +1,5 @@
-// Package warp fetches the WARP device reserved bytes from the Cloudflare
-// API to identify the client during WireGuard handshakes.
+// Package warp retrieves client identity parameters from Cloudflare API to enable
+// valid WireGuard tunnel handshakes.
 package warp
 
 import (
@@ -41,8 +41,8 @@ type deviceResponse struct {
 	Error string `json:"error"`
 }
 
-// FetchReserved reads device credentials from the account file and retrieves
-// client reserved bytes from the API to configure WireGuard parameters.
+// FetchReserved queries Cloudflare API using provisioned account tokens to acquire
+// reserved handshake bytes for WireGuard tunnel establishment.
 func FetchReserved(accountFile string, log *logging.Logger) ([3]byte, error) {
 	var empty [3]byte
 

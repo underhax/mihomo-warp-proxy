@@ -1,29 +1,5 @@
-// Package mihomo manages the mihomo config.yaml lifecycle.
-// The central design constraint is that config.yaml is user-owned: this
-// package may only write fields it explicitly declares as its own. Every
-// other key — custom listeners, proxy-groups, rule-providers, additional
-// proxies, custom rules — must survive a patch cycle unmodified, including
-// their original key order.
-//
-// Owned fields (always overwritten from Config):
-//
-//	Top-level:  mixed-port, log-level, ipv6, allow-lan, bind-address,
-//	            authentication
-//	Geo block:  geodata-mode, geodata-loader, geo-auto-update,
-//	            geo-update-interval, geox-url.*  (added/removed per GEO flag)
-//	proxies[]:  the single entry where .name == "warp" (only when
-//	            USE_WARP_CONFIG=true; left untouched otherwise)
-//
-// rules[] and proxies[] (except the "warp" entry) are only written during
-// first-run template creation. On subsequent patch cycles they are never
-// touched — the user owns them entirely.
-//
-// Key order is preserved on patch by using yaml.Node for the full document
-// round-trip. map[string]any is used only in createTemplate where there is
-// no existing file to preserve.
-//
-// When USE_WARP_CONFIG=false the entire config is left as-is.
-// proxies, rules and all other sections are not touched.
+// Package mihomo synchronizes runtime settings into the mihomo proxy configuration,
+// preserving custom user rules and proxies across patch cycles.
 package mihomo
 
 import (
@@ -35,7 +11,7 @@ import (
 	"strconv"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/fsutil"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/config"
 	"github.com/underhax/mihomo-warp-proxy/internal/logging"
@@ -52,9 +28,8 @@ const (
 	yamlTagStr  = "!!str"
 )
 
-// EnsureConfig creates config.yaml from a minimal template when it does not
-// exist, then patches it with current environment values.
-// When the file already exists only owned fields are updated.
+// EnsureConfig provisions or updates config.yaml to apply active runtime options
+// while preserving user-defined routing rules and custom proxies.
 func EnsureConfig(cfg *config.Config, profile *wgcf.Profile, reserved [3]byte, log *logging.Logger) error {
 	if _, err := os.Stat(cfg.Paths.MihomoConfigFile); err != nil {
 		if os.IsNotExist(err) {

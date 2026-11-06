@@ -1,5 +1,5 @@
-// Package wgcf manages the Cloudflare WARP WireGuard configuration lifecycle
-// via the wgcf binary, provisioning accounts and extracting profile details.
+// Package wgcf automates Cloudflare WARP account registration and WireGuard profile
+// generation to establish upstream proxy tunneling.
 package wgcf
 
 import (
@@ -37,8 +37,8 @@ var (
 
 const maxWgcfFileSize = 64 * 1024
 
-// Profile holds the WireGuard parameters extracted from wgcf-profile.conf
-// that are needed to populate the mihomo proxy block.
+// Profile contains WireGuard cryptographic keys and tunnel endpoints necessary to configure
+// mihomo proxy connections.
 type Profile struct {
 	PrivateKey string
 	PublicKey  string
@@ -46,9 +46,8 @@ type Profile struct {
 	IPv6       string
 }
 
-// Setup ensures a valid wgcf account and WireGuard profile exist under
-// cfg.Paths.WgcfData, creating or regenerating them as directed by configuration.
-func Setup(cfg *config.Config, log *logging.Logger) error {
+// Setup provisions or refreshes the Cloudflare WARP WireGuard profile to ensure valid tunnel credentials.
+func Setup(ctx context.Context, cfg *config.Config, log *logging.Logger) error {
 	if err := osMkdirAll(cfg.Paths.WgcfData, 0o750); err != nil {
 		return fmt.Errorf("wgcf: create data directory %q: %w", cfg.Paths.WgcfData, err)
 	}
@@ -73,21 +72,21 @@ func Setup(cfg *config.Config, log *logging.Logger) error {
 
 	if !accountExists {
 		log.Debug("wgcf: registering new account")
-		if err := register(cfg, log); err != nil {
+		if err := register(ctx, cfg, log); err != nil {
 			return err
 		}
 	}
 
 	if cfg.Warp.PlusKey != "" {
 		log.Debug("wgcf: applying WARP+ license key")
-		if err := updateLicense(cfg, log); err != nil {
+		if err := updateLicense(ctx, cfg, log); err != nil {
 			log.Warnf("wgcf: WARP+ key update failed, continuing with free account: %v", err)
 		}
 	}
 
 	if !profileExists || cfg.Warp.PlusKey != "" {
 		log.Debug("wgcf: generating WireGuard profile")
-		if err := generate(cfg, log); err != nil {
+		if err := generate(ctx, cfg, log); err != nil {
 			return err
 		}
 	}
@@ -99,8 +98,7 @@ func Setup(cfg *config.Config, log *logging.Logger) error {
 	return nil
 }
 
-// ParseProfile reads cfg.Paths.WgcfProfileFile and returns the extracted
-// WireGuard parameters required for mihomo proxy generation.
+// ParseProfile extracts WireGuard keys and addresses from the profile file to construct proxy descriptors.
 func ParseProfile(cfg *config.Config) (profile *Profile, retErr error) {
 	path := cfg.Paths.WgcfProfileFile
 
@@ -142,23 +140,23 @@ func ParseProfile(cfg *config.Config) (profile *Profile, retErr error) {
 	return p, nil
 }
 
-func register(cfg *config.Config, log *logging.Logger) error {
-	return runWgcf(cfg, log, "register", "--accept-tos")
+func register(ctx context.Context, cfg *config.Config, log *logging.Logger) error {
+	return runWgcf(ctx, cfg, log, "register", "--accept-tos")
 }
 
-func updateLicense(cfg *config.Config, log *logging.Logger) error {
-	return runWgcf(cfg, log, "update", "--license-key", cfg.Warp.PlusKey)
+func updateLicense(ctx context.Context, cfg *config.Config, log *logging.Logger) error {
+	return runWgcf(ctx, cfg, log, "update", "--license-key", cfg.Warp.PlusKey)
 }
 
-func generate(cfg *config.Config, log *logging.Logger) error {
-	return runWgcf(cfg, log, "generate")
+func generate(ctx context.Context, cfg *config.Config, log *logging.Logger) error {
+	return runWgcf(ctx, cfg, log, "generate")
 }
 
-func runWgcf(cfg *config.Config, log *logging.Logger, args ...string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func runWgcf(ctx context.Context, cfg *config.Config, log *logging.Logger, args ...string) error {
+	cmdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	out, err := executeWgcf(ctx, cfg.Paths.WgcfBin, cfg.Paths.WgcfData, args...)
+	out, err := executeWgcf(cmdCtx, cfg.Paths.WgcfBin, cfg.Paths.WgcfData, args...)
 	if err != nil {
 		return fmt.Errorf("wgcf %s: %w\noutput: %s",
 			redactArgs(args), err, sanitizeOutput(out))
@@ -316,23 +314,6 @@ func sanitizeOutput(b []byte) string {
 		return s[:limit] + "…"
 	}
 	return s
-}
-
-// EndpointHost extracts the hostname component from the configured WARP endpoint.
-func EndpointHost(cfg *config.Config) string {
-	host, _, _ := strings.Cut(cfg.Warp.Endpoint, ":")
-	return host
-}
-
-// EndpointPort extracts the port component from the configured WARP endpoint.
-func EndpointPort(cfg *config.Config) string {
-	_, port, _ := strings.Cut(cfg.Warp.Endpoint, ":")
-	return port
-}
-
-// ProfilePath computes the absolute path to the WireGuard profile configuration.
-func ProfilePath(cfg *config.Config) string {
-	return filepath.Join(cfg.Paths.WgcfData, "wgcf-profile.conf")
 }
 
 func defaultFileClose(f *os.File) error {

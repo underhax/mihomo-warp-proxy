@@ -36,6 +36,8 @@ func TestValidateGeoURL(t *testing.T) {
 		{"CR encoding", "https://example.com/%0dfile", true},
 		{"dotdot encoding", "https://example.com/%2e%2efile", true},
 		{"percent encoding", "https://example.com/%25file", true},
+		{"resolve host error", "https://unresolved.example.com/file.dat", true},
+		{"valid https URL", "https://example.com/file.dat", false},
 	}
 
 	for _, tc := range cases {
@@ -417,7 +419,7 @@ func TestPrepareGeoFiles(t *testing.T) {
 
 	log := logging.New(logging.LevelDebug, "test")
 
-	if err := PrepareGeoFiles(cfg, log); err != nil {
+	if err := PrepareGeoFiles(t.Context(), cfg, log); err != nil {
 		t.Fatalf("PrepareGeoFiles failed: %v", err)
 	}
 
@@ -451,7 +453,7 @@ func TestPrepareGeoFiles(t *testing.T) {
 	}
 
 	cfg.Geo.Redownload = false
-	if err := PrepareGeoFiles(cfg, log); err != nil {
+	if err := PrepareGeoFiles(t.Context(), cfg, log); err != nil {
 		t.Fatalf("second PrepareGeoFiles failed: %v", err)
 	}
 }
@@ -493,14 +495,14 @@ func TestFetchMetaErrors(t *testing.T) {
 
 	t.Run("status 404", func(t *testing.T) {
 		client := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusNotFound, header: http.Header{}}}
-		if _, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com"); err == nil {
+		if _, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/file", "example.com"); err == nil {
 			t.Error("expected error for 404, got nil")
 		}
 	})
 
 	t.Run("redirect missing location", func(t *testing.T) {
 		client := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusFound, header: http.Header{}}}
-		if _, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com"); err == nil {
+		if _, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/file", "example.com"); err == nil {
 			t.Error("expected error for redirect without location, got nil")
 		}
 	})
@@ -509,7 +511,7 @@ func TestFetchMetaErrors(t *testing.T) {
 		h := http.Header{}
 		h.Set("Location", "https://example.com/file")
 		client := &http.Client{Transport: &mockStatusRoundTripper{statusCode: http.StatusFound, header: h}}
-		if _, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com"); err == nil {
+		if _, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/file", "example.com"); err == nil {
 			t.Error("expected error for redirect loop, got nil")
 		}
 	})
@@ -652,7 +654,7 @@ func TestDownloadMetaFetchFails(t *testing.T) {
 	client := &http.Client{Transport: &mockHeadFailRoundTripper{}}
 	dst := filepath.Join(dir, "test.dat")
 
-	if err := download(client, cfg, log, "https://example.com/fallback.dat", dst); err == nil {
+	if err := download(t.Context(), client, cfg, log, "https://example.com/fallback.dat", dst); err == nil {
 		t.Error("expected error on HEAD failure, got nil")
 	}
 }
@@ -683,7 +685,7 @@ func TestDownloadWriteCacheMetaWarn(t *testing.T) {
 	client := mockNewHTTPClient()
 	dst := filepath.Join(dir, "test.dat")
 
-	if err := download(client, cfg, log, "https://example.com/file.dat", dst); err != nil {
+	if err := download(t.Context(), client, cfg, log, "https://example.com/file.dat", dst); err != nil {
 		t.Fatalf("download should succeed despite cache write failure: %v", err)
 	}
 }
@@ -724,7 +726,7 @@ func TestFetchMetaRedirectNoLocation(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{}
-	_, _, err := fetchMeta(client, cfg, "https://example.com/redirect", "example.com")
+	_, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/redirect", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "no Location header") {
 		t.Errorf("expected no Location header error, got: %v", err)
 	}
@@ -750,7 +752,7 @@ func TestFetchMetaStatusError(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{}
-	_, _, err := fetchMeta(client, cfg, "https://example.com/notfound", "example.com")
+	_, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/notfound", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 404") {
 		t.Errorf("expected 404 status error, got: %v", err)
 	}
@@ -800,7 +802,7 @@ func TestFetchMetaMaxRedirectsExceeded(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{}
-	_, _, err := fetchMeta(client, cfg, "https://example.com/loop", "example.com")
+	_, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/loop", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "exceeded") {
 		t.Errorf("expected exceeded max redirects error, got: %v", err)
 	}
@@ -831,7 +833,7 @@ func TestFetchMetaRedirectToInvalidTarget(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{}
-	_, _, err := fetchMeta(client, cfg, "https://example.com/start", "example.com")
+	_, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/start", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "redirect target invalid") {
 		t.Errorf("expected redirect target invalid error, got: %v", err)
 	}
@@ -965,7 +967,7 @@ func TestPrepareGeoFilesError(t *testing.T) {
 		},
 	}
 	log := logging.New(logging.LevelDebug, "test")
-	err := PrepareGeoFiles(cfg, log)
+	err := PrepareGeoFiles(t.Context(), cfg, log)
 	if err == nil || !strings.Contains(err.Error(), "sync downloads") {
 		t.Errorf("expected sync downloads error, got: %v", err)
 	}
@@ -1025,7 +1027,7 @@ func TestFetchMetaInvalidRedirectLocation(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{}
-	_, _, err := fetchMeta(client, cfg, "https://example.com/badloc", "example.com")
+	_, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/badloc", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "resolve redirect location") {
 		t.Errorf("expected resolve redirect location error, got: %v", err)
 	}
@@ -1052,7 +1054,7 @@ func TestStreamToFileSaveError(t *testing.T) {
 	if err := os.Mkdir(existingDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err := streamToFile(client, cfg, "https://example.com/file.dat", "example.com", existingDir)
+	err := streamToFile(t.Context(), client, cfg, "https://example.com/file.dat", "example.com", existingDir)
 	if err == nil {
 		t.Error("expected error when streamToFile destination is a directory, got nil")
 	}
@@ -1103,7 +1105,7 @@ func TestFetchMetaBodyCloseError(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{}
-	_, _, err := fetchMeta(client, cfg, "https://example.com/file", "example.com")
+	_, _, err := fetchMeta(t.Context(), client, cfg, "https://example.com/file", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "close HEAD response") {
 		t.Errorf("expected close HEAD response error, got: %v", err)
 	}
@@ -1126,7 +1128,7 @@ func TestStreamToFileBodyCloseError(t *testing.T) {
 	}
 	cfg := &config.Config{}
 	dst := filepath.Join(t.TempDir(), "out.dat")
-	err := streamToFile(client, cfg, "https://example.com/file", "example.com", dst)
+	err := streamToFile(t.Context(), client, cfg, "https://example.com/file", "example.com", dst)
 	if err == nil || !strings.Contains(err.Error(), "close response body") {
 		t.Errorf("expected close response body error, got: %v", err)
 	}
@@ -1226,7 +1228,7 @@ func TestDownloadChmodError(t *testing.T) {
 		return errors.New("mock chmod error")
 	}
 
-	err := download(client, cfg, log, "https://example.com/file.dat", dst)
+	err := download(t.Context(), client, cfg, log, "https://example.com/file.dat", dst)
 	if err == nil || !strings.Contains(err.Error(), "chmod") {
 		t.Errorf("expected chmod error, got: %v", err)
 	}
@@ -1260,7 +1262,7 @@ func TestDownloadURLParseError(t *testing.T) {
 
 	cfg := &config.Config{Paths: config.Paths{MihomoData: t.TempDir()}}
 	log := logging.New(logging.LevelDebug, "test")
-	err := download(mockNewHTTPClient(), cfg, log, "https://example.com/file.dat", filepath.Join(cfg.Paths.MihomoData, "file.dat"))
+	err := download(t.Context(), mockNewHTTPClient(), cfg, log, "https://example.com/file.dat", filepath.Join(cfg.Paths.MihomoData, "file.dat"))
 	if err == nil || !strings.Contains(err.Error(), "parse original URL") {
 		t.Errorf("expected parse original URL error, got: %v", err)
 	}
@@ -1295,7 +1297,7 @@ func TestDownloadStreamToFileError(t *testing.T) {
 	}
 	cfg := &config.Config{Paths: config.Paths{MihomoData: dir}}
 	log := logging.New(logging.LevelDebug, "test")
-	err := download(client, cfg, log, "https://example.com/file.dat", filepath.Join(dir, "file.dat"))
+	err := download(t.Context(), client, cfg, log, "https://example.com/file.dat", filepath.Join(dir, "file.dat"))
 	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 500") {
 		t.Errorf("expected download streamToFile error, got: %v", err)
 	}
@@ -1313,7 +1315,7 @@ func TestFetchMetaRequestAndDoErrors(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	_, _, err := fetchMeta(mockNewHTTPClient(), cfg, "https://example.com/file", "example.com")
+	_, _, err := fetchMeta(t.Context(), mockNewHTTPClient(), cfg, "https://example.com/file", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "create HEAD request") {
 		t.Errorf("expected create HEAD request error, got: %v", err)
 	}
@@ -1326,7 +1328,7 @@ func TestFetchMetaRequestAndDoErrors(t *testing.T) {
 			},
 		},
 	}
-	_, _, err = fetchMeta(clientErr, cfg, "https://example.com/file", "example.com")
+	_, _, err = fetchMeta(t.Context(), clientErr, cfg, "https://example.com/file", "example.com")
 	if err == nil || !strings.Contains(err.Error(), "create HEAD request") {
 		t.Errorf("expected network failure error, got: %v", err)
 	}
@@ -1346,7 +1348,7 @@ func TestStreamToFileOpenStreamError(t *testing.T) {
 	}
 	cfg := &config.Config{}
 	dst := filepath.Join(t.TempDir(), "out.dat")
-	err := streamToFile(client, cfg, "https://example.com/file", "example.com", dst)
+	err := streamToFile(t.Context(), client, cfg, "https://example.com/file", "example.com", dst)
 	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 500") {
 		t.Errorf("expected open stream error, got: %v", err)
 	}

@@ -266,3 +266,19 @@ func TestIsRestrictedIPMore(t *testing.T) {
 		t.Error("site-local IPv6 should be restricted")
 	}
 }
+
+func TestDefaultLookupHost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := defaultLookupHost(ctx, "example.com"); err == nil {
+		t.Error("expected error for canceled context, got nil")
+	}
+
+	addrs, err := defaultLookupHost(context.Background(), "127.0.0.2")
+	if err != nil {
+		t.Fatalf("unexpected error for IP literal: %v", err)
+	}
+	if len(addrs) == 0 || addrs[0] != "127.0.0.2" {
+		t.Errorf("expected [127.0.0.2], got %v", addrs)
+	}
+}

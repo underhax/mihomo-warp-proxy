@@ -1,6 +1,5 @@
-// Package backup provides atomic backup of the mihomo config file.
-// A backup is created before any mutation so that a failed config update
-// never leaves the user without a recoverable previous state.
+// Package backup safeguards proxy configuration by preserving a recoverable snapshot
+// prior to runtime modifications.
 package backup
 
 import (
@@ -15,8 +14,8 @@ import (
 
 const maxBackupSize = 1024 * 1024
 
-// ConfigFile atomically copies src to src+".back" if src exists, is non-empty,
-// and its parent directory is writable by the current process.
+// ConfigFile preserves an atomic snapshot of the target configuration file to ensure
+// recovery if subsequent patching operations fail.
 func ConfigFile(src string) error {
 	if resolved, err := filepath.EvalSymlinks(src); err == nil {
 		src = resolved

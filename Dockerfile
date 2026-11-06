@@ -1,6 +1,8 @@
 FROM virb3/wgcf:2.3.1@sha256:49d6409a14fea1c3c30e306b1aa9bbe7847a7b4fe93899166dd16954c8eee400 AS wgcf
 FROM metacubex/mihomo:v1.19.33@sha256:9211361a3ed85305383288d38c05e85862d6d5a590c10007c37fc059cca82e9c AS mihomo
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
+
+SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -10,49 +12,43 @@ WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w -X main.version=${MIHOMO_VERSION}" \
     -trimpath \
-    -o /entrypoint \
-    ./cmd/entrypoint/
+    -o /out/entrypoint \
+    ./cmd/entrypoint/ \
+    && mkdir -p /out/app/mihomo \
+                /out/app/wgcf \
+                /out/tmp \
+                /out/run \
+                /out/etc/ssl/certs \
+    && cp /etc/ssl/certs/ca-certificates.crt /out/etc/ssl/certs/ca-certificates.crt \
+    && chmod 0700 /out/app/mihomo /out/app/wgcf \
+    && chmod 1777 /out/tmp /out/run \
+    && chmod 0755 /out/etc /out/etc/ssl /out/etc/ssl/certs \
+    && chmod 0444 /out/etc/ssl/certs/ca-certificates.crt
 
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM scratch
 
-SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
-
-LABEL org.opencontainers.image.source="https://github.com/underhax/mihomo-warp-proxy" \
-      org.opencontainers.image.description="Cloudflare WARP SOCKS5/HTTP(S) proxy via mihomo (Clash Meta)" \
-      maintainer="underhax"
-
-# hadolint ignore=DL3018
-RUN apk add --no-cache \
-        su-exec \
-        tini \
-        curl \
-        tzdata \
-    && addgroup -g 911 -S mihomo \
-    && adduser -u 911 -D -S -G mihomo mihomo
-
-COPY --from=go-builder /entrypoint /usr/local/bin/entrypoint
-COPY --from=wgcf /wgcf /usr/local/bin/wgcf
-COPY --from=mihomo /mihomo /usr/local/bin/mihomo
-
-RUN chmod 0555 /usr/local/bin/entrypoint \
-               /usr/local/bin/mihomo \
-               /usr/local/bin/wgcf \
-    && mkdir -p /app/mihomo /app/wgcf /app/logs \
-    && chown -R 911:911 /app \
-    && chmod 0750 /app/mihomo /app/wgcf
-
-ENV PROXY_UID=911 \
-    PROXY_GID=911 \
-    MULTI_USER_MODE=true \
+ENV PATH=/usr/local/bin \
     PROXY_PORT=7890 \
     PROXY_LOG_LEVEL=error \
     SCRIPT_LOG_LEVEL=ERROR
 
+COPY --from=builder /out/etc /etc
+COPY --from=builder /out/app /app
+COPY --from=builder /out/tmp /tmp
+COPY --from=builder /out/run /run
+
+COPY --from=builder --chmod=0555 /out/entrypoint /usr/local/bin/entrypoint
+COPY --from=wgcf --chmod=0555 /wgcf /usr/local/bin/wgcf
+COPY --from=mihomo --chmod=0555 /mihomo /usr/local/bin/mihomo
+
+VOLUME ["/app/mihomo", "/app/wgcf"]
+
 WORKDIR /app
 EXPOSE 7890
 
-ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint"]
+ENTRYPOINT ["/usr/local/bin/entrypoint"]

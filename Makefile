@@ -1,4 +1,4 @@
-.PHONY: check test coverage vulncheck trivy docker-lint verify clean
+.PHONY: check test coverage vulncheck trivy docker-lint secrets-scan verify clean
 
 check:
 	@test -z "$$(gofmt -s -l .)" || (echo "Unformatted files found. Run 'gofmt -s -w .' to fix them." && false)
@@ -21,7 +21,10 @@ trivy:
 docker-lint:
 	hadolint Dockerfile
 
-verify: check test vulncheck trivy docker-lint
+secrets-scan:
+	gitleaks detect --source . --no-git --no-color
+
+verify: check test vulncheck trivy docker-lint secrets-scan
 
 clean:
 	rm -rf coverage *.out .gocache

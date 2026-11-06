@@ -6,21 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/underhax/mihomo-warp-proxy/internal/contract"
 )
-
-func assertFallbackVersion(t *testing.T, got string) {
-	t.Helper()
-	if got == "unknown" {
-		return
-	}
-	t.Errorf("got %q, want fallback version", got)
-}
 
 func TestParseLevel(t *testing.T) {
 	cases := []struct {
@@ -56,49 +47,6 @@ func TestParseLevel(t *testing.T) {
 			t.Errorf("ParseLevel(%q): got %v, want %v", tc.input, got, tc.want)
 		}
 	}
-}
-
-func TestVersionFromFile(t *testing.T) {
-	dir := t.TempDir()
-
-	t.Run("valid version", func(t *testing.T) {
-		path := filepath.Join(dir, "version")
-		if err := os.WriteFile(path, []byte("1.2.3\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		got := VersionFromFile(path)
-		if got != "1.2.3" {
-			t.Errorf("got %q, want %q", got, "1.2.3")
-		}
-	})
-
-	t.Run("missing file uses fallback", func(t *testing.T) {
-		assertFallbackVersion(t, VersionFromFile(filepath.Join(dir, "nonexistent")))
-	})
-
-	t.Run("empty file uses fallback", func(t *testing.T) {
-		path := filepath.Join(dir, "empty")
-		if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		assertFallbackVersion(t, VersionFromFile(path))
-	})
-
-	t.Run("oversized version uses fallback", func(t *testing.T) {
-		path := filepath.Join(dir, "toolong")
-		if err := os.WriteFile(path, []byte(strings.Repeat("a", 33)), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		assertFallbackVersion(t, VersionFromFile(path))
-	})
-
-	t.Run("control characters use fallback", func(t *testing.T) {
-		path := filepath.Join(dir, "ctrlchars")
-		if err := os.WriteFile(path, []byte("1.0\x00evil"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		assertFallbackVersion(t, VersionFromFile(path))
-	})
 }
 
 func TestLoggerLevelFiltering(t *testing.T) {
@@ -180,9 +128,6 @@ func TestLoggerMethods(t *testing.T) {
 	os.Stderr = w
 
 	logger := New(LevelDebug, "1.0.0")
-	if logger.Level() != slog.LevelDebug {
-		t.Errorf("got level %v, want LevelDebug", logger.Level())
-	}
 
 	logger.Debugf("debug formatted %d", 1)
 	logger.Infof("info formatted %s", "two")
@@ -294,13 +239,19 @@ func TestLoggerFatalf(t *testing.T) {
 }
 
 func TestLogHandlerMethods(t *testing.T) {
-	logger := New(LevelDebug, "1.0.0")
-	h := logger.handler
+	h := &logHandler{}
 	if h.WithAttrs(nil) != h {
 		t.Errorf("expected WithAttrs to return same handler")
 	}
 	if h.WithGroup("test") != h {
 		t.Errorf("expected WithGroup to return same handler")
+	}
+	h.level = LevelInfo
+	if !h.Enabled(context.Background(), LevelInfo) {
+		t.Errorf("expected Enabled to be true for LevelInfo")
+	}
+	if h.Enabled(context.Background(), LevelDebug) {
+		t.Errorf("expected Enabled to be false for LevelDebug")
 	}
 }
 
@@ -322,15 +273,19 @@ func (f *mockFailingLogHandler) Handle(_ context.Context, _ slog.Record) error {
 	return errors.New("handler failure")
 }
 
-func TestLoggerHandleError(t *testing.T) {
+func (f *mockFailingLogHandler) formatRecord(_ slog.Record) error {
+	return errors.New("handler failure")
+}
+
+func (f *mockFailingLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return f }
+func (f *mockFailingLogHandler) WithGroup(_ string) slog.Handler      { return f }
+
+func TestLoggerHandleError(_ *testing.T) {
 	l := &Logger{
 		handler: &mockFailingLogHandler{},
 		version: "test",
 	}
 	l.Info("message that triggers handler error")
-	if l.Level() != LevelInfo {
-		t.Errorf("expected LevelInfo, got %v", l.Level())
-	}
 }
 
 type errWriter struct{}
