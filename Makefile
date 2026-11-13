@@ -22,7 +22,7 @@ docker-lint:
 	hadolint Dockerfile
 
 secrets-scan:
-	gitleaks detect --source . --no-git --no-color
+	gitleaks detect --source . --no-git --no-color -v --redact
 
 verify: check test vulncheck trivy docker-lint secrets-scan
 
