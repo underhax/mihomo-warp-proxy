@@ -1,6 +1,6 @@
 FROM virb3/wgcf:2.3.1@sha256:49d6409a14fea1c3c30e306b1aa9bbe7847a7b4fe93899166dd16954c8eee400 AS wgcf
 FROM metacubex/mihomo:v1.19.34@sha256:4c2495d705f152897a58eac410350f243835fd01ce2fe44949a571faa824d532 AS mihomo
-FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine3.24@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine3.24@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS builder
 
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
